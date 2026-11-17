@@ -1,0 +1,6 @@
+# 运行日志
+optimize_log.txt
+# 驱动下载临时目录
+_drivers/
+# Office 临时文件
+~$*
