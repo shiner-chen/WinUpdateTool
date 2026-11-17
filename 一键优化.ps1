@@ -303,13 +303,81 @@ function Disable-UsbRedirection {
 }
 
 # ═══════════════════════════════════════════════════════════
-# Module 3：关闭 USB 节能（USB 选择性挂起）
+# 电源方案工具（powercfg 为外部命令，失败不会抛异常，需检查退出码）
 # ═══════════════════════════════════════════════════════════
 
-function Disable-UsbSelectiveSuspend {
-    Write-Section '关闭 USB 节能（USB 选择性挂起）'
+# 文档 关闭USB节能及系统睡眠优化设置.docx 中"电源选项 → 高级设置"涉及的项
+$PowerSettings = @(
+    @{ Desc = '硬盘 → 在此时间后关闭硬盘';            Sub = 'SUB_DISK';                             Set = 'DISKIDLE';                             Off = 0; Default = @{ AC = 1200; DC = 600 } }
+    @{ Desc = '睡眠 → 在此时间后睡眠';                Sub = 'SUB_SLEEP';                            Set = 'STANDBYIDLE';                          Off = 0; Default = @{ AC = 1800; DC = 900 } }
+    @{ Desc = '睡眠 → 允许混合睡眠';                  Sub = 'SUB_SLEEP';                            Set = 'HYBRIDSLEEP';                          Off = 0; Default = @{ AC = 1;    DC = 1   } }
+    @{ Desc = '睡眠 → 在此时间后休眠';                Sub = 'SUB_SLEEP';                            Set = 'HIBERNATEIDLE';                        Off = 0; Default = @{ AC = 0;    DC = 0   } }
+    @{ Desc = 'USB 设置 → USB 选择性暂停设置';         Sub = '2a737441-1930-4402-8d77-b2bebba308a3'; Set = '48e6b7a6-50f5-4782-a5d4-53bb8f07e226'; Off = 0; Default = @{ AC = 1;    DC = 1   } }
+    @{ Desc = 'PCI Express → 链接状态电源管理';        Sub = 'SUB_PCIEXPRESS';                       Set = 'ASPM';                                 Off = 0; Default = @{ AC = 1;    DC = 2   } }
+)
 
-    # 层A：全局注册表
+function Invoke-PowerCfg {
+    # 用 $args 透传参数；不重定向 stderr（PS 5.1 + EAP=Stop 下 2>&1 会误抛异常）
+    $out = & powercfg @args
+    if ($LASTEXITCODE -ne 0) {
+        throw "powercfg $($args -join ' ') 失败（退出码 $LASTEXITCODE）：$($out -join ' ')"
+    }
+    return $out
+}
+
+function Get-PowerSettingValue {
+    # 返回 @{ AC = int; DC = int }（当前活动方案）
+    param([string]$Sub, [string]$Set)
+    $out  = Invoke-PowerCfg /q SCHEME_CURRENT $Sub $Set
+    # 输出中最后两个 0x 值依次为"当前交流/直流电源设置索引"（中英文系统通用）
+    $hexs = [regex]::Matches(($out -join "`n"), '0x([0-9a-fA-F]{8})') | ForEach-Object { [Convert]::ToInt64($_.Groups[1].Value, 16) }
+    $hexs = @($hexs)
+    if ($hexs.Count -lt 2) { throw "无法解析 powercfg /q 输出：$Sub $Set" }
+    return @{ AC = $hexs[-2]; DC = $hexs[-1] }
+}
+
+function Set-PowerSettingValue {
+    param([string]$Sub, [string]$Set, [int]$AC, [int]$DC)
+    Invoke-PowerCfg /setacvalueindex SCHEME_CURRENT $Sub $Set $AC | Out-Null
+    Invoke-PowerCfg /setdcvalueindex SCHEME_CURRENT $Sub $Set $DC | Out-Null
+}
+
+# ═══════════════════════════════════════════════════════════
+# Module 3：关闭 USB 节能
+# 参照 关闭USB节能及系统睡眠优化设置.docx：
+#   设备管理器 → 通用串行总线控制器 → 所有 USB 设备 → 电源管理
+#   → 取消勾选"允许计算机关闭此设备以节约电源"
+# 实现：该勾选框对应 WMI root\wmi:MSPower_DeviceEnable.Enable（与设备管理器 UI 同一接口）
+# ═══════════════════════════════════════════════════════════
+
+function Set-UsbDevicePowerManagement {
+    # $Enable = $false → 取消勾选；$true → 恢复勾选
+    param([bool]$Enable, [string]$Prefix = '')
+    # 设备管理器"通用串行总线控制器"= 设备类 USB
+    $ids = @(Get-PnpDevice -Class USB -ErrorAction Stop | ForEach-Object { $_.InstanceId.ToUpper() })
+    $pm  = @(Get-CimInstance -Namespace root\wmi -ClassName MSPower_DeviceEnable -ErrorAction Stop)
+    $ok = 0; $fail = 0
+    foreach ($inst in $pm) {
+        # InstanceName = <设备实例ID>_<序号>
+        $devId = ($inst.InstanceName -replace '_\d+$', '').ToUpper()
+        if ($ids -notcontains $devId) { continue }
+        try {
+            if ($inst.Enable -ne $Enable) {
+                Set-CimInstance -InputObject $inst -Property @{ Enable = $Enable } -ErrorAction Stop
+            }
+            $ok++
+        } catch {
+            $fail++
+            Write-Log -Level ERROR -Message "${Prefix}设置设备电源管理失败：${devId}（$($_.Exception.Message)）"
+        }
+    }
+    return @{ OK = $ok; Fail = $fail }
+}
+
+function Disable-UsbSelectiveSuspend {
+    Write-Section '关闭 USB 节能'
+
+    # 层A：全局注册表禁用 USB 选择性挂起
     try {
         $usbSvc = 'HKLM:\SYSTEM\CurrentControlSet\Services\USB'
         if (-not (Test-Path $usbSvc)) { New-Item -Path $usbSvc -Force | Out-Null }
@@ -319,73 +387,76 @@ function Disable-UsbSelectiveSuspend {
         Write-Log -Level ERROR -Message "[层A] 注册表写入失败：$($_.Exception.Message)"
     }
 
-    # 层B：当前电源方案 (powercfg)
+    # 层B：设备管理器 → 通用串行总线控制器 → 所有设备 → 取消"允许计算机关闭此设备以节约电源"
     try {
-        $schemeRaw = & powercfg /getactivescheme
-        if ($schemeRaw -match '([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})') {
-            $scheme = $Matches[1]
-            & powercfg /setacvalueindex $scheme 2a737441-1930-4402-8d77-b2bebba308a3 48e6b7a6-50f5-4782-a5d4-53bb8f07e226 0
-            & powercfg /setdcvalueindex $scheme 2a737441-1930-4402-8d77-b2bebba308a3 48e6b7a6-50f5-4782-a5d4-53bb8f07e226 0
-            & powercfg /setactive $scheme
-            Write-Log -Level OK -Message '[层B] 电源方案中 USB 选择性挂起已禁用（交流+直流）'
+        $r = Set-UsbDevicePowerManagement -Enable $false -Prefix '[层B] '
+        if ($r.OK -eq 0 -and $r.Fail -eq 0) {
+            Write-Log -Level INFO -Message '[层B] 未找到带"电源管理"选项的 USB 设备，跳过'
+        } elseif ($r.Fail -eq 0) {
+            Write-Log -Level OK -Message "[层B] 已对 $($r.OK) 个 USB 设备取消勾选`"允许计算机关闭此设备以节约电源`""
         } else {
-            Write-Log -Level WARN -Message '[层B] 无法解析当前电源方案 GUID，跳过'
+            Write-Log -Level WARN -Message "[层B] 成功 $($r.OK) 个，失败 $($r.Fail) 个"
         }
     } catch {
-        Write-Log -Level ERROR -Message "[层B] powercfg 执行失败：$($_.Exception.Message)"
+        Write-Log -Level ERROR -Message "[层B] 设置 USB 设备电源管理失败：$($_.Exception.Message)"
     }
-
-    # 层C：遍历 USB Root Hub 实例
-    try {
-        $enumPath = 'HKLM:\SYSTEM\CurrentControlSet\Enum\USB'
-        $count    = 0
-        if (Test-Path $enumPath) {
-            Get-ChildItem $enumPath -ErrorAction SilentlyContinue | ForEach-Object {
-                Get-ChildItem $_.PSPath -ErrorAction SilentlyContinue | ForEach-Object {
-                    if ($_.PSChildName -match 'Root_Hub|RootHub|root_hub') {
-                        $dpPath = Join-Path $_.PSPath 'Device Parameters'
-                        if (Test-Path $dpPath) {
-                            try {
-                                Set-ItemProperty -Path $dpPath -Name 'AllowIdleIrpInD3' -Value 0 -Type DWord -Force
-                                $count++
-                            } catch {}
-                        }
-                    }
-                }
-            }
-        }
-        $msg = if ($count -gt 0) { "[层C] 已对 $count 个 USB Root Hub 实例关闭节能唤醒" } `
-                                 else { '[层C] 未找到 Root Hub 设备实例，跳过' }
-        Write-Log -Level INFO -Message $msg
-    } catch {
-        Write-Log -Level ERROR -Message "[层C] 遍历设备管理器注册表失败：$($_.Exception.Message)"
-    }
+    # USB 选择性暂停（电源选项）在 Module 4 中与其他电源项统一设置并校验
 }
 
 # ═══════════════════════════════════════════════════════════
-# Module 4：关闭系统睡眠 / 休眠
+# Module 4：电源选项（当前活动方案）
+# 参照 关闭USB节能及系统睡眠优化设置.docx → 电源选项 → 高级设置：
+#   关闭硬盘=从不、睡眠=从不、混合睡眠=关闭、休眠=从不、
+#   USB 选择性暂停=已禁用、PCI Express 链接状态电源管理=关闭
+# 注意：不执行 powercfg /h off —— 关闭休眠后"允许混合睡眠/在此时间后休眠"
+#       会从电源选项界面消失，与文档截图不一致；休眠超时已设为"从不"。
 # ═══════════════════════════════════════════════════════════
 
 function Disable-SleepAndHibernate {
-    Write-Section '关闭系统睡眠与休眠'
+    Write-Section '电源选项：关闭睡眠 / 休眠 / 硬盘 / USB / PCIe 节能'
 
-    $cmds = @(
-        @{ Desc = '关闭显示器(AC)'; Cmd = { powercfg /change monitor-timeout-ac 0 } }
-        @{ Desc = '关闭显示器(DC)'; Cmd = { powercfg /change monitor-timeout-dc 0 } }
-        @{ Desc = '关闭硬盘(AC)';   Cmd = { powercfg /change disk-timeout-ac 0 } }
-        @{ Desc = '关闭硬盘(DC)';   Cmd = { powercfg /change disk-timeout-dc 0 } }
-        @{ Desc = '睡眠(AC)';       Cmd = { powercfg /change standby-timeout-ac 0 } }
-        @{ Desc = '睡眠(DC)';       Cmd = { powercfg /change standby-timeout-dc 0 } }
-        @{ Desc = '休眠(AC)';       Cmd = { powercfg /change hibernate-timeout-ac 0 } }
-        @{ Desc = '休眠(DC)';       Cmd = { powercfg /change hibernate-timeout-dc 0 } }
-        @{ Desc = '禁用休眠';       Cmd = { powercfg /h off } }
-    )
-    foreach ($item in $cmds) {
+    try {
+        $scheme = (Invoke-PowerCfg /getactivescheme) -join ' '
+        Write-Log -Level INFO -Message "当前活动电源方案：$($scheme.Trim())"
+    } catch {
+        Write-Log -Level ERROR -Message "无法获取当前电源方案：$($_.Exception.Message)"
+        return
+    }
+
+    # 显示器关闭（文档未要求，保持原脚本行为）
+    try {
+        Invoke-PowerCfg /change monitor-timeout-ac 0 | Out-Null
+        Invoke-PowerCfg /change monitor-timeout-dc 0 | Out-Null
+        Write-Log -Level OK -Message '已设置：关闭显示器 = 从不（交流+直流）'
+    } catch {
+        Write-Log -Level ERROR -Message "设置失败 [关闭显示器]：$($_.Exception.Message)"
+    }
+
+    foreach ($s in $PowerSettings) {
         try {
-            & $item.Cmd
-            Write-Log -Level OK -Message "已设置：$($item.Desc)"
+            Set-PowerSettingValue -Sub $s.Sub -Set $s.Set -AC $s.Off -DC $s.Off
         } catch {
-            Write-Log -Level ERROR -Message "设置失败 [$($item.Desc)]：$($_.Exception.Message)"
+            Write-Log -Level ERROR -Message "设置失败 [$($s.Desc)]：$($_.Exception.Message)"
+        }
+    }
+
+    try {
+        Invoke-PowerCfg /setactive SCHEME_CURRENT | Out-Null
+    } catch {
+        Write-Log -Level ERROR -Message "重新激活电源方案失败：$($_.Exception.Message)"
+    }
+
+    # 回读校验
+    foreach ($s in $PowerSettings) {
+        try {
+            $v = Get-PowerSettingValue -Sub $s.Sub -Set $s.Set
+            if ($v.AC -eq $s.Off -and $v.DC -eq $s.Off) {
+                Write-Log -Level OK -Message "已生效：$($s.Desc)（交流=$($v.AC) 直流=$($v.DC)）"
+            } else {
+                Write-Log -Level ERROR -Message "未生效：$($s.Desc)（交流=$($v.AC) 直流=$($v.DC)，期望 $($s.Off)）"
+            }
+        } catch {
+            Write-Log -Level WARN -Message "无法校验 [$($s.Desc)]：$($_.Exception.Message)"
         }
     }
 }
@@ -429,62 +500,40 @@ function Invoke-Rollback {
         Write-Log -Level ERROR -Message "[回退] USB 节能注册表恢复失败：$($_.Exception.Message)"
     }
 
-    # --- 回退 USB 节能（层B：电源方案恢复默认值 1=启用）---
+    # --- 回退 USB 设备电源管理：恢复勾选"允许计算机关闭此设备以节约电源" ---
     try {
-        $schemeRaw = & powercfg /getactivescheme
-        if ($schemeRaw -match '([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})') {
-            $scheme = $Matches[1]
-            & powercfg /setacvalueindex $scheme 2a737441-1930-4402-8d77-b2bebba308a3 48e6b7a6-50f5-4782-a5d4-53bb8f07e226 1
-            & powercfg /setdcvalueindex $scheme 2a737441-1930-4402-8d77-b2bebba308a3 48e6b7a6-50f5-4782-a5d4-53bb8f07e226 1
-            & powercfg /setactive $scheme
-            Write-Log -Level OK -Message '[回退] 电源方案 USB 选择性挂起已恢复（交流+直流 = 启用）'
-        }
+        $r = Set-UsbDevicePowerManagement -Enable $true -Prefix '[回退] '
+        Write-Log -Level OK -Message "[回退] 已对 $($r.OK) 个 USB 设备恢复勾选`"允许计算机关闭此设备以节约电源`"（失败 $($r.Fail) 个）"
     } catch {
-        Write-Log -Level ERROR -Message "[回退] powercfg USB 恢复失败：$($_.Exception.Message)"
+        Write-Log -Level ERROR -Message "[回退] USB 设备电源管理恢复失败：$($_.Exception.Message)"
     }
 
-    # --- 回退 USB Root Hub AllowIdleIrpInD3（层C）---
-    try {
-        $enumPath = 'HKLM:\SYSTEM\CurrentControlSet\Enum\USB'
-        $count    = 0
-        if (Test-Path $enumPath) {
-            Get-ChildItem $enumPath -ErrorAction SilentlyContinue | ForEach-Object {
-                Get-ChildItem $_.PSPath -ErrorAction SilentlyContinue | ForEach-Object {
-                    if ($_.PSChildName -match 'Root_Hub|RootHub|root_hub') {
-                        $dpPath = Join-Path $_.PSPath 'Device Parameters'
-                        if (Test-Path $dpPath) {
-                            try {
-                                Set-ItemProperty -Path $dpPath -Name 'AllowIdleIrpInD3' -Value 1 -Type DWord -Force
-                                $count++
-                            } catch {}
-                        }
-                    }
-                }
-            }
-        }
-        if ($count -gt 0) { Write-Log -Level OK -Message "[回退] 已对 $count 个 USB Root Hub 恢复节能唤醒" }
-    } catch {
-        Write-Log -Level ERROR -Message "[回退] USB Root Hub 注册表恢复失败：$($_.Exception.Message)"
-    }
-
-    # --- 回退睡眠：恢复 Windows 默认值 ---
-    $defaults = @(
-        @{ Desc = '显示器超时(AC) 恢复 10 分钟'; Cmd = { powercfg /change monitor-timeout-ac 10 } }
-        @{ Desc = '显示器超时(DC) 恢复 5 分钟';  Cmd = { powercfg /change monitor-timeout-dc 5  } }
-        @{ Desc = '硬盘超时(AC)   恢复 20 分钟'; Cmd = { powercfg /change disk-timeout-ac 20 } }
-        @{ Desc = '硬盘超时(DC)   恢复 10 分钟'; Cmd = { powercfg /change disk-timeout-dc 10 } }
-        @{ Desc = '睡眠超时(AC)   恢复 30 分钟'; Cmd = { powercfg /change standby-timeout-ac 30 } }
-        @{ Desc = '睡眠超时(DC)   恢复 15 分钟'; Cmd = { powercfg /change standby-timeout-dc 15 } }
-        @{ Desc = '休眠超时 恢复 0（从不）';      Cmd = { powercfg /change hibernate-timeout-ac 0; powercfg /change hibernate-timeout-dc 0 } }
-        @{ Desc = '重新启用休眠';                   Cmd = { powercfg /h on } }
-    )
-    foreach ($item in $defaults) {
+    # --- 回退电源选项：恢复 Windows"平衡"方案默认值 ---
+    foreach ($s in $PowerSettings) {
         try {
-            & $item.Cmd
-            Write-Log -Level OK -Message "[回退] $($item.Desc)"
+            Set-PowerSettingValue -Sub $s.Sub -Set $s.Set -AC $s.Default.AC -DC $s.Default.DC
+            Write-Log -Level OK -Message "[回退] $($s.Desc) 恢复默认（交流=$($s.Default.AC) 直流=$($s.Default.DC)）"
         } catch {
-            Write-Log -Level ERROR -Message "[回退] 失败 [$($item.Desc)]：$($_.Exception.Message)"
+            Write-Log -Level ERROR -Message "[回退] 失败 [$($s.Desc)]：$($_.Exception.Message)"
         }
+    }
+    try {
+        Invoke-PowerCfg /change monitor-timeout-ac 10 | Out-Null
+        Invoke-PowerCfg /change monitor-timeout-dc 5  | Out-Null
+        Write-Log -Level OK -Message '[回退] 关闭显示器 恢复默认（交流 10 分钟 / 直流 5 分钟）'
+    } catch {
+        Write-Log -Level ERROR -Message "[回退] 失败 [关闭显示器]：$($_.Exception.Message)"
+    }
+    try {
+        Invoke-PowerCfg /h on | Out-Null   # 兼容旧版脚本曾执行过 powercfg /h off
+        Write-Log -Level OK -Message '[回退] 休眠功能已启用'
+    } catch {
+        Write-Log -Level WARN -Message "[回退] 启用休眠失败（部分设备/虚拟机不支持休眠）：$($_.Exception.Message)"
+    }
+    try {
+        Invoke-PowerCfg /setactive SCHEME_CURRENT | Out-Null
+    } catch {
+        Write-Log -Level ERROR -Message "[回退] 重新激活电源方案失败：$($_.Exception.Message)"
     }
 
     Write-Log -Level OK -Message '回退完成，建议重启以使所有策略生效'
