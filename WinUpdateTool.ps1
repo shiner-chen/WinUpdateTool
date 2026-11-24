@@ -332,7 +332,8 @@ function Get-OfflinePatchIdentity {
 function Install-OfflineWindowsPatches {
     param([string]$Path)
 
-    Write-Section '离线 Windows 补丁安装'
+    $activity = '离线 Windows 补丁安装'
+    Write-Section $activity
     Write-Log -Level INFO -Message "补丁目录为 $Path"
     $files = @(Get-ChildItem -LiteralPath $Path -File -Recurse | Where-Object Extension -in '.msu', '.cab')
     if ($files.Count -eq 0) {
@@ -428,16 +429,31 @@ function Install-OfflineWindowsPatches {
                 continue
             }
             try {
-                Write-Log -Level INFO -Message "检查并安装 $($package.Key)"
+                $completed = $installed + $skipped + $failed
+                $status = "已处理 $completed / $($packages.Count) 个补丁"
+                Write-Log -Level INFO -Message "检查并安装 $($package.Key)（$status）"
                 if ($package.File.Extension -eq '.cab' -or ($build -ge 26100 -and $package.Role -eq 2)) {
                     # 联机映像指正在运行的 Windows，补丁来源仍是本地文件。
                     $installer = Join-Path $env:SystemRoot 'System32\dism.exe'
                     $arguments = '/Online /Add-Package /NoRestart /PackagePath:"{0}"' -f $package.File.FullName
+                    # DISM 在当前控制台显示自己的安装进度。
+                    $process = Start-Process -FilePath $installer -ArgumentList $arguments -NoNewWindow -Wait -PassThru
                 } else {
                     $installer = Join-Path $env:SystemRoot 'System32\wusa.exe'
                     $arguments = '"{0}" /quiet /norestart' -f $package.File.FullName
+                    # WUSA 静默安装时，按批次完成数绘制进度，并显示当前补丁的等待时间。
+                    $percent = [int][Math]::Floor(100 * $completed / $packages.Count)
+                    $timer = [Diagnostics.Stopwatch]::StartNew()
+                    try {
+                        $process = Start-Process -FilePath $installer -ArgumentList $arguments -NoNewWindow -PassThru
+                        do {
+                            $elapsed = $timer.Elapsed.ToString('hh\:mm\:ss')
+                            Write-Progress -Activity $activity -Status $status -PercentComplete $percent -CurrentOperation "正在检查或安装 $($package.Key)（已等待 $elapsed）"
+                        } while (-not $process.WaitForExit(1000))
+                    } finally {
+                        Write-Progress -Activity $activity -Completed
+                    }
                 }
-                $process = Start-Process -FilePath $installer -ArgumentList $arguments -NoNewWindow -Wait -PassThru
                 $code = '{0:X8}' -f ([int]$process.ExitCode)
                 switch ($code) {
                     { $_ -in '00000000','00000BC2','00000669','00240005' } {
@@ -1105,7 +1121,7 @@ function Install-AdlinkPackages {
                 $installStatus = Invoke-DriverInstall -FilePath $packageFile -DriverDir $packageDir
                 $packageResults[$packageKey] = $true
                 $processed++
-                if ($installStatus -ne 'PnPProcessed') {
+                if ($installStatus -notin 'PnPProcessed', 'Skipped') {
                     Write-Log -Level OK -Message "安装完成：$($package.Name)"
                 }
             } catch {
@@ -1168,8 +1184,12 @@ function Install-DriverInf {
     })
     $exitCode = $LASTEXITCODE
     if ($exitCode -eq 259 -and
-        ($output -match '已成功添加驱动程序包|Driver package added successfully|already in the driver store') -and
-        -not ($output -match '添加驱动程序包失败|无法添加驱动程序包|安装驱动程序包失败|Failed to (add|install) driver package|Error (adding|installing) driver package')) {
+        ($output -match '已成功添加驱动程序(?:程序)?包|Driver package added successfully|already in the driver store') -and
+        -not ($output -match '(?:添加|安装)驱动程序(?:程序)?包失败|无法(?:添加|安装)驱动程序(?:程序)?包|Failed to (add|install) driver package|Error (adding|installing) driver package')) {
+        if ($output -match '设备上的驱动程序(?:程序)?包是最新的|Driver package is (?:already )?up[ -]to[ -]date on (?:the )?device') {
+            Write-Log -Level INFO -Message '设备已安装同等或更合适的驱动，跳过本次安装。'
+            return 'Skipped'
+        }
         Write-Log -Level INFO -Message 'PnPUtil 已处理驱动包。部分驱动没有匹配设备，或设备已有同等或更合适的驱动。'
         return 'PnPProcessed'
     }
@@ -1206,19 +1226,23 @@ function Install-OfflineDrivers {
 
     $workDir = Join-Path $ScriptDir '_drivers\offline'
     New-Item -ItemType Directory -Path $workDir -Force | Out-Null
-    $index = $failed = 0
+    $index = $skipped = $failed = 0
     foreach ($entry in $entries) {
         $index++
         try {
             Write-Log -Level INFO -Message "正在安装 [$index/$($entries.Count)] $entry"
             $status = Invoke-DriverInstall -FilePath $entry -DriverDir $workDir
-            if ($status -ne 'PnPProcessed') { Write-Log -Level OK -Message "安装完成。$entry" }
+            if ($status -eq 'Skipped') {
+                $skipped++
+            } elseif ($status -ne 'PnPProcessed') {
+                Write-Log -Level OK -Message "安装完成。$entry"
+            }
         } catch {
             $failed++
             Write-Log -Level WARN -Message "离线安装未完成。$entry。$($_.Exception.Message)"
         }
     }
-    Write-Log -Level INFO -Message "离线驱动和软件包结果：已处理 $($entries.Count - $failed) 个，未完成 $failed 个。"
+    Write-Log -Level INFO -Message "离线驱动和软件包结果：处理完成 $($entries.Count - $skipped - $failed) 个，跳过 $skipped 个，未完成 $failed 个。"
     return ($failed -eq 0)
 }
 
@@ -1352,30 +1376,35 @@ function Main {
     if ($Help) {
         Write-Host @'
 
-用法：
-  .\WinUpdateTool.ps1                不带参数，全量执行所有模块
-  .\WinUpdateTool.ps1 -Patch         仅安装 WinPatches 中的离线补丁
-  .\WinUpdateTool.ps1 -USB           仅关闭 USB 节能、USB 重定向及系统睡眠/休眠
-  .\WinUpdateTool.ps1 -Driver        仅安装 Drivers 中的离线驱动和软件包
-  .\WinUpdateTool.ps1 -Rollback      回退 USB 节能、USB 重定向及睡眠设置（恢复默认值）
-  .\WinUpdateTool.ps1 -Help          显示此帮助信息（也可用 -h 或 -?）
+WinUpdateTool 使用说明
 
-离线目录可通过参数指定。
-  .\WinUpdateTool.ps1 -Patch -PatchPath "D:\离线补丁"
-  .\WinUpdateTool.ps1 -Driver -DriverPath "D:\离线驱动"
+在工具所在目录运行以下命令。
 
--Online 对选中的补丁和驱动模块启用联网安装。
-  .\WinUpdateTool.ps1 -Online
-  .\WinUpdateTool.ps1 -Patch -Online
-  .\WinUpdateTool.ps1 -Driver -Online
-  .\WinUpdateTool.ps1 -Driver -Online -AdlinkPassword
-  .\WinUpdateTool.ps1 -Driver -Online -AdlinkLogin
+常用命令
+  .\WinUpdateTool.cmd -Help       查看帮助（也可用 -h 或 -?）
+  .\WinUpdateTool.cmd             全量执行，默认离线安装补丁和驱动，并应用 USB 与电源设置
+  .\WinUpdateTool.cmd -Patch      仅安装离线 Windows 补丁
+  .\WinUpdateTool.cmd -Driver     仅安装离线驱动和软件包
+  .\WinUpdateTool.cmd -USB        仅应用 USB 重定向、USB 节能及电源设置
+  .\WinUpdateTool.cmd -Rollback   将 USB 重定向、USB 节能及睡眠设置恢复为默认值
 
-注意：
-  - 在线驱动适用型号见同目录的 支持产品.psd1
-  - 需以管理员身份运行
-  - 如遇 PowerShell 执行策略限制，可用 .\WinUpdateTool.cmd 传入相同参数
-  - 日志输出至脚本同级目录 optimize_log.txt
+指定离线目录
+  默认从工具目录下的 WinPatches 和 Drivers 读取安装包。
+  .\WinUpdateTool.cmd -Patch -PatchPath "D:\离线补丁"
+  .\WinUpdateTool.cmd -Driver -DriverPath "D:\离线驱动"
+
+联网安装
+  -Online 为本次选中的补丁或驱动任务启用联网安装。
+  .\WinUpdateTool.cmd -Online
+  .\WinUpdateTool.cmd -Patch -Online
+  .\WinUpdateTool.cmd -Driver -Online
+  .\WinUpdateTool.cmd -Driver -Online -AdlinkPassword
+  .\WinUpdateTool.cmd -Driver -Online -AdlinkLogin
+
+使用提示
+  - 执行安装、设置或回退前，请以管理员身份打开命令提示符。
+  - 在线驱动支持的机型见工具目录下的 支持产品.psd1。
+  - 运行日志保存在工具目录下的 optimize_log.txt。
 
 '@
         exit 0
