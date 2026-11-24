@@ -4,7 +4,7 @@
 
 纯脚本模式（PowerShell，不依赖第三方 GUI 工具）一键完成以下功能：
 
-脚本启动时读取 BIOS 中的产品型号，并在 `支持产品.psd1` 中查找对应的 ADLINK 产品编号。当前映射为 `IMB-C47 = 2184`。
+在线驱动模式读取 BIOS 中的产品型号，并在 `支持产品.psd1` 中查找对应的 ADLINK 产品编号。当前映射为 `IMB-C47 = 2184`。
 
 1. **产品型号检测**
    - 从 `Win32_BIOS.SMBIOSBIOSVersion` 解析产品型号。型号未登记时，脚本记录原因并退出。
@@ -67,10 +67,11 @@ WinUpdateTool/
 
 | PowerShell 中的命令 | 执行内容 |
 |---------------------|----------|
-| `.\WinUpdateTool.cmd` | 全量优化 |
-| `.\WinUpdateTool.cmd -Patch` | 安装 Windows 补丁 |
+| `.\WinUpdateTool.cmd` | 全量优化，使用脚本同级的 WinPatches 和 Drivers |
+| `.\WinUpdateTool.cmd -Patch` | 安装 WinPatches 中的离线补丁 |
 | `.\WinUpdateTool.cmd -USB` | USB 和睡眠优化 |
-| `.\WinUpdateTool.cmd -Driver` | 下载和安装驱动，官网要求登录时打开窗口 |
+| `.\WinUpdateTool.cmd -Driver` | 安装 Drivers 中的离线驱动和软件包 |
+| `.\WinUpdateTool.cmd -Driver -Online` | 下载和安装驱动，官网要求登录时打开窗口 |
 | `.\WinUpdateTool.cmd -Rollback` | 回退 USB 和睡眠设置 |
 | `.\WinUpdateTool.cmd -Patch -Driver` | 安装补丁和驱动 |
 
@@ -78,6 +79,8 @@ WinUpdateTool/
 
 官网要求登录时，脚本会打开 Windows 凭据窗口。输入 ADLINK 登录邮箱和密码，官网确认登录后，脚本会自动刷新目录并继续下载和安装。登录会话仅用于本次运行。可加 `-AdlinkPassword` 在查询目录前打开登录窗口。
 
-使用已登录的浏览器会话时，运行 `.\WinUpdateTool.cmd -Driver -AdlinkLogin`。在浏览器开发者工具的「网络」面板中，选中发往 `www.adlinktech.com.cn` 的已登录请求，把请求头中 `Cookie` 的值粘贴到脚本的隐藏输入提示中。
+使用已登录的浏览器会话时，运行 `.\WinUpdateTool.cmd -Driver -Online -AdlinkLogin`。在浏览器开发者工具的「网络」面板中，选中发往 `www.adlinktech.com.cn` 的已登录请求，把请求头中 `Cookie` 的值粘贴到脚本的隐藏输入提示中。
 
-可以把手动下载的文件放到 `_drivers`、`_drivers\<pdNo>` 或日志给出的包目录。脚本联网获取本机适用的包清单后，优先安装文件名和大小与官网记录一致的本地包。缺少匹配文件时，下载进度条会显示包序号、包名、百分比和已下载大小。
+离线安装仅读取所选模块的本地包目录。可通过 `-PatchPath` 和 `-DriverPath` 指定其他目录。启动时发现所需目录缺失，脚本会要求创建目录并复制安装包，或指定现有目录。
+
+在线驱动模式可复用 `_drivers`、`_drivers\<pdNo>` 或日志给出的包目录内与官网记录一致的本地文件。需要在线下载时，进度条显示包序号、包名、百分比和已下载大小。

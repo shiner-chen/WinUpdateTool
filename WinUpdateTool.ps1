@@ -7,7 +7,10 @@
 
       -Patch          仅执行系统补丁安装
       -USB            仅执行关闭 USB 节能、重定向及系统睡眠
-      -Driver         仅执行驱动包下载与安装
+      -Driver         仅安装驱动及软件包
+      -Online         补丁使用 Windows Update，驱动使用 ADLINK 官网
+      -PatchPath      指定离线补丁目录，默认为脚本同级 WinPatches
+      -DriverPath     指定离线驱动目录，默认为脚本同级 Drivers
       -AdlinkLogin    提示输入已登录的 ADLINK 浏览器会话 Cookie
       -AdlinkPassword 在查询驱动目录前打开 ADLINK 登录窗口
       -Rollback       回退 USB 节能、USB 重定向及睡眠设置（恢复默认值）
@@ -22,6 +25,11 @@ param(
     [switch]$Patch,
     [switch]$USB,
     [switch]$Driver,
+    [switch]$Online,
+    [ValidateNotNullOrEmpty()]
+    [string]$PatchPath,
+    [ValidateNotNullOrEmpty()]
+    [string]$DriverPath,
     [switch]$AdlinkLogin,
     [switch]$AdlinkPassword,
     [switch]$Rollback,
@@ -175,11 +183,18 @@ function Assert-Admin {
         [Security.Principal.WindowsBuiltInRole]::Administrator)
     if (-not $isAdmin) {
         Write-Warning '需要管理员权限，正在以管理员身份重新启动脚本...'
-        $switchArgs = foreach ($name in $script:PSBoundParameters.Keys) {
-            if ($script:PSBoundParameters[$name]) { "-$name" }
+        $forwardedArgs = foreach ($name in $script:PSBoundParameters.Keys) {
+            $value = $script:PSBoundParameters[$name]
+            if ($value) {
+                "-$name"
+                if ($name -in 'PatchPath', 'DriverPath') {
+                    # Windows 命令行中的结束引号之前需要将路径末尾的反斜杠加倍。
+                    '"{0}"' -f ($value -replace '(\\+)$', '$1$1')
+                }
+            }
         }
         $fwdArgs = '-NoProfile -ExecutionPolicy Bypass -File "{0}" {1}' -f `
-            $PSCommandPath, ($switchArgs -join ' ')
+            $PSCommandPath, ($forwardedArgs -join ' ')
         $powershell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
         $process = Start-Process -FilePath $powershell -ArgumentList $fwdArgs -Verb RunAs -Wait -PassThru
         exit $process.ExitCode
@@ -242,7 +257,7 @@ function Install-WindowsPatches {
         $updates = $result.Updates
         if ($updates.Count -eq 0) {
             Write-Log -Level OK -Message '系统已是最新，无需安装补丁'
-            return
+            return $true
         }
         Write-Log -Level INFO -Message "找到 $($updates.Count) 个可用更新，开始下载..."
         $downloader         = $session.CreateUpdateDownloader()
@@ -265,9 +280,217 @@ function Install-WindowsPatches {
         } else {
             Write-Log -Level OK -Message '所有补丁安装完成，无需重启'
         }
+        return ($instResult.ResultCode -eq 2)
     } catch {
         Write-Log -Level ERROR -Message "补丁安装失败：$($_.Exception.Message)"
+        return $false
     }
+}
+
+function Get-OfflinePatchIdentity {
+    param([IO.FileInfo]$File, [string]$MetadataDir)
+
+    # MSU 的外层 XML 可提供程序集标识。CAB 的标识及前置项在 update.mum 中。
+    $expand = Join-Path $env:SystemRoot 'System32\expand.exe'
+    $documents = @()
+    if ($File.Extension -eq '.msu') {
+        & $expand $File.FullName '-F:*.xml' $MetadataDir | Out-Null
+        $documents = @(Get-ChildItem -LiteralPath $MetadataDir -File -Filter '*.xml')
+    } else {
+        & $expand $File.FullName '-F:update.mum' $MetadataDir | Out-Null
+        $documents = @(Get-ChildItem -LiteralPath $MetadataDir -File -Filter 'update.mum')
+    }
+
+    $identities = @()
+    $parents = @()
+    foreach ($document in $documents) {
+        try {
+            [xml]$xml = Get-Content -LiteralPath $document.FullName -Raw
+        } catch {
+            Write-Log -Level INFO -Message "由 Windows 安装服务检查无法读取的包元数据。$($File.Name)"
+            continue
+        }
+        $identities += $xml.SelectNodes("/*[local-name()='assembly']/*[local-name()='assemblyIdentity'] | //*[local-name()='servicing']/*[local-name()='package']/*[local-name()='assemblyIdentity']")
+        $parents += $xml.SelectNodes("/*[local-name()='assembly']/*[local-name()='package']/*[local-name()='parent']/*[local-name()='assemblyIdentity']")
+    }
+
+    if ($File.Extension -eq '.msu' -and
+        -not ($identities | Where-Object { $_.GetAttribute('name') -match 'RollupFix|ServicingStack' })) {
+        # 外层 XML 缺少服务堆栈或累积更新标识时，从主 CAB 获取版本和依赖。
+        & $expand $File.FullName '-F:Windows*-KB*.cab' $MetadataDir | Out-Null
+        foreach ($payload in (Get-ChildItem -LiteralPath $MetadataDir -File -Filter '*.cab')) {
+            $identity = Get-OfflinePatchIdentity -File $payload -MetadataDir $MetadataDir
+            $identities += $identity.Identities
+            $parents += $identity.Parents
+            [IO.File]::Delete($payload.FullName)
+            [IO.File]::Delete((Join-Path $MetadataDir 'update.mum'))
+        }
+    }
+    return @{ Identities = $identities; Parents = $parents }
+}
+
+function Install-OfflineWindowsPatches {
+    param([string]$Path)
+
+    Write-Section '离线 Windows 补丁安装'
+    Write-Log -Level INFO -Message "补丁目录为 $Path"
+    $files = @(Get-ChildItem -LiteralPath $Path -File -Recurse | Where-Object Extension -in '.msu', '.cab')
+    if ($files.Count -eq 0) {
+        Write-Log -Level INFO -Message '目录中没有 MSU 或 CAB 补丁。请将离线补丁包复制到该目录。'
+        return $true
+    }
+
+    $environmentKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment'
+    $architecture = (Get-ItemPropertyValue -LiteralPath $environmentKey -Name PROCESSOR_ARCHITECTURE).ToLowerInvariant()
+    $build = [int](Get-ItemPropertyValue -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -Name CurrentBuildNumber)
+    $dependencies = @{}
+    $manifestPath = Join-Path $Path 'Dependencies.psd1'
+    if (Test-Path -LiteralPath $manifestPath -PathType Leaf) {
+        $dependencies = Import-PowerShellDataFile -LiteralPath $manifestPath
+    }
+
+    $root = $Path.TrimEnd('\') + '\'
+    $metadataRoot = Join-Path ([IO.Path]::GetTempPath()) ('WinUpdateTool-patch-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $metadataRoot | Out-Null
+    $packages = @(
+        foreach ($file in $files) {
+            $metadataDir = Join-Path $metadataRoot ([guid]::NewGuid().ToString('N'))
+            New-Item -ItemType Directory -Path $metadataDir | Out-Null
+            try {
+                Write-Log -Level INFO -Message "读取补丁元数据。$($file.Name)"
+                $metadata = Get-OfflinePatchIdentity -File $file -MetadataDir $metadataDir
+                $architectures = @($metadata.Identities | ForEach-Object { $_.GetAttribute('processorArchitecture') } | Where-Object { $_ })
+                if ($architectures.Count -eq 0 -and $file.BaseName -match '(?:^|[-_.])(x64|amd64|arm64|x86)(?:[-_.]|$)') {
+                    $architectures = @(if ($Matches[1] -eq 'x64') { 'amd64' } else { $Matches[1] })
+                }
+                $key = $file.FullName.Substring($root.Length)
+                if ($architectures.Count -gt 0 -and $architecture -notin $architectures -and 'neutral' -notin $architectures) {
+                    Write-Log -Level INFO -Message "跳过与 $architecture 架构不匹配的补丁 $key"
+                    continue
+                }
+                $identities = @($metadata.Identities | ForEach-Object { $_.GetAttribute('name') })
+                $role = 1
+                if ($identities -match 'RollupFix' -or $file.BaseName -match '(?:^|[-_.])LCU(?:[-_.]|$)') { $role = 2 }
+                elseif ($identities -match 'ServicingStack' -or $file.BaseName -match '(?:^|[-_.])SSU(?:[-_.]|$)') { $role = 0 }
+                $versions = @(
+                    foreach ($identity in $metadata.Identities) {
+                        $version = $null
+                        if ([version]::TryParse($identity.GetAttribute('version'), [ref]$version)) { $version }
+                    }
+                )
+                $requires = @()
+                if ($dependencies.ContainsKey($key)) {
+                    $requires = @($dependencies[$key] | ForEach-Object { ([string]$_).Replace('/', '\') })
+                }
+                [pscustomobject]@{
+                    File = $file
+                    Key = $key
+                    Role = $role
+                    Version = ($versions | Sort-Object -Descending | Select-Object -First 1)
+                    Requires = $requires
+                    Identities = $identities
+                    Parents = @($metadata.Parents | ForEach-Object { $_.GetAttribute('name') })
+                    Result = ''
+                }
+            } finally {
+                try { [IO.Directory]::Delete($metadataDir, $true) }
+                catch { Write-Log -Level WARN -Message "未能清理补丁元数据目录 $metadataDir。$($_.Exception.Message)" }
+            }
+        }
+    )
+    try { [IO.Directory]::Delete($metadataRoot) }
+    catch { Write-Log -Level WARN -Message "补丁元数据目录已保留在 $metadataRoot。" }
+    if ($packages.Count -eq 0) { return $true }
+
+    $packages = @($packages | Sort-Object Role, Version, Key)
+    $available = @{}
+    foreach ($package in $packages) { $available[$package.Key] = $package }
+    $pending = $packages
+    $installed = $skipped = $failed = 0
+    do {
+        $remaining = [Collections.Generic.List[object]]::new()
+        $progress = $false
+        foreach ($package in $pending) {
+            $blocked = @($package.Requires | Where-Object { -not $available.ContainsKey($_) -or $available[$_].Result -ne 'Ready' })
+            if ($blocked.Count -gt 0) {
+                $package.Result = "等待指定的前置补丁 $($blocked -join ', ')"
+                $remaining.Add($package)
+                continue
+            }
+            $parentPending = $pending | Where-Object {
+                $_.Result -ne 'Ready' -and -not $_.Result -and $_.Key -ne $package.Key -and
+                ($_.Identities | Where-Object { $_ -in $package.Parents })
+            } | Select-Object -First 1
+            if ($parentPending) {
+                $package.Result = "等待候选前置补丁 $($parentPending.Key)"
+                $remaining.Add($package)
+                $progress = $true
+                continue
+            }
+            try {
+                Write-Log -Level INFO -Message "检查并安装 $($package.Key)"
+                if ($package.File.Extension -eq '.cab' -or ($build -ge 26100 -and $package.Role -eq 2)) {
+                    # 联机映像指正在运行的 Windows，补丁来源仍是本地文件。
+                    $installer = Join-Path $env:SystemRoot 'System32\dism.exe'
+                    $arguments = '/Online /Add-Package /NoRestart /PackagePath:"{0}"' -f $package.File.FullName
+                } else {
+                    $installer = Join-Path $env:SystemRoot 'System32\wusa.exe'
+                    $arguments = '"{0}" /quiet /norestart' -f $package.File.FullName
+                }
+                $process = Start-Process -FilePath $installer -ArgumentList $arguments -NoNewWindow -Wait -PassThru
+                $code = '{0:X8}' -f ([int]$process.ExitCode)
+                switch ($code) {
+                    { $_ -in '00000000','00000BC2','00000669','00240005' } {
+                        if ($code -eq '00240005') {
+                            $script:NeedReboot = $true
+                        } elseif ($process.ExitCode -ne 0) {
+                            Complete-DriverInstall -Name $package.Key -ExitCode $process.ExitCode
+                        }
+                        $package.Result = 'Ready'
+                        $installed++
+                        $progress = $true
+                        Write-Log -Level OK -Message "补丁处理完成。$($package.Key)"
+                    }
+                    '00240006' {
+                        $package.Result = 'Ready'
+                        $skipped++
+                        $progress = $true
+                        Write-Log -Level INFO -Message "补丁已安装。$($package.Key)"
+                    }
+                    '80242014' {
+                        $script:NeedReboot = $true
+                        $package.Result = "Windows 要求重启后继续（0x$code）"
+                        $remaining.Add($package)
+                    }
+                    { $_ -in '80240016','80240017','800F081E','800F0823','800F0831','80242017' } {
+                        $package.Result = "0x$code"
+                        $remaining.Add($package)
+                    }
+                    default { throw "Windows 安装服务返回 0x$code。" }
+                }
+            } catch {
+                $package.Result = 'Failed'
+                $failed++
+                Write-Log -Level WARN -Message "补丁 $($package.Key) 安装失败。$($_.Exception.Message)"
+            }
+        }
+        $pending = @($remaining.ToArray())
+    } while ($progress -and $pending.Count -gt 0)
+
+    foreach ($package in $pending) {
+        if ($package.Result -in '0x80240017','0x800F081E') {
+            $skipped++
+            Write-Log -Level INFO -Message "Windows 判定补丁不适用或已被取代。$($package.Key)（$($package.Result)）"
+        } else {
+            $failed++
+            Write-Log -Level WARN -Message "补丁 $($package.Key) 未完成。$($package.Result)"
+        }
+    }
+    if ($failed -gt 0 -and $script:NeedReboot) {
+        Write-Log -Level INFO -Message '重启后可重新运行相同命令，继续处理剩余补丁。'
+    }
+    Write-Log -Level INFO -Message "离线补丁结果：处理完成 $installed 个，跳过 $skipped 个，未完成 $failed 个。"
+    return ($failed -eq 0)
 }
 
 # ═══════════════════════════════════════════════════════════
@@ -923,6 +1146,82 @@ function Complete-DriverInstall {
     }
 }
 
+function Find-DriverInstaller {
+    param([IO.FileInfo[]]$Files)
+
+    $Files | Where-Object {
+        $_.Extension -eq '.exe' -and $_.BaseName -match '^(setup|install|setupchipset|setupserialio|meisetup|setupme|igxpin)([-_ ]?(x64|64|amd64))?$'
+    } | Sort-Object { $_.FullName.Length }, FullName | Select-Object -First 1
+}
+
+function Install-DriverInf {
+    param([string]$Path, [switch]$Recursive)
+
+    $arguments = @('/add-driver', $Path)
+    if ($Recursive) { $arguments += '/subdirs' }
+    $arguments += '/install'
+    $output = @(& pnputil.exe @arguments | ForEach-Object {
+        if ($_ -ne '') {
+            Write-Log -Level INFO -Message $_
+            $_
+        }
+    })
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -eq 259 -and
+        ($output -match '已成功添加驱动程序包|Driver package added successfully|already in the driver store') -and
+        -not ($output -match '添加驱动程序包失败|无法添加驱动程序包|安装驱动程序包失败|Failed to (add|install) driver package|Error (adding|installing) driver package')) {
+        Write-Log -Level INFO -Message 'PnPUtil 已处理驱动包。部分驱动没有匹配设备，或设备已有同等或更合适的驱动。'
+        return 'PnPProcessed'
+    }
+    Complete-DriverInstall -Name 'pnputil' -ExitCode $exitCode
+}
+
+function Get-OfflineDriverEntries {
+    param([string]$Path, [switch]$PackageDirectory)
+
+    $files = @(Get-ChildItem -LiteralPath $Path -File)
+    if ($PackageDirectory) {
+        $entry = Find-DriverInstaller -Files $files
+        if ($entry) {
+            $entry.FullName
+            return
+        }
+    }
+    $files | Where-Object Extension -in '.zip', '.exe', '.msi', '.inf' | ForEach-Object FullName
+    foreach ($directory in (Get-ChildItem -LiteralPath $Path -Directory | Where-Object { -not ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) })) {
+        Get-OfflineDriverEntries -Path $directory.FullName -PackageDirectory
+    }
+}
+
+function Install-OfflineDrivers {
+    param([string]$Path)
+
+    Write-Section '离线驱动和软件包安装'
+    Write-Log -Level INFO -Message "驱动和软件包目录为 $Path"
+    $entries = @(Get-OfflineDriverEntries -Path $Path | Sort-Object)
+    if ($entries.Count -eq 0) {
+        Write-Log -Level INFO -Message '目录中没有 ZIP、EXE、MSI 或 INF 安装包。请将离线安装包复制到该目录。'
+        return $true
+    }
+
+    $workDir = Join-Path $ScriptDir '_drivers\offline'
+    New-Item -ItemType Directory -Path $workDir -Force | Out-Null
+    $index = $failed = 0
+    foreach ($entry in $entries) {
+        $index++
+        try {
+            Write-Log -Level INFO -Message "正在安装 [$index/$($entries.Count)] $entry"
+            $status = Invoke-DriverInstall -FilePath $entry -DriverDir $workDir
+            if ($status -ne 'PnPProcessed') { Write-Log -Level OK -Message "安装完成。$entry" }
+        } catch {
+            $failed++
+            Write-Log -Level WARN -Message "离线安装未完成。$entry。$($_.Exception.Message)"
+        }
+    }
+    Write-Log -Level INFO -Message "离线驱动和软件包结果：已处理 $($entries.Count - $failed) 个，未完成 $failed 个。"
+    return ($failed -eq 0)
+}
+
 function Invoke-DriverInstall {
     param([string]$FilePath, [string]$DriverDir)
 
@@ -933,9 +1232,7 @@ function Invoke-DriverInstall {
             Add-Type -AssemblyName System.IO.Compression.FileSystem
             [System.IO.Compression.ZipFile]::ExtractToDirectory($FilePath, $extractDir)
             $files = @(Get-ChildItem -LiteralPath $extractDir -Recurse -File)
-            $installer = $files | Where-Object {
-                $_.Extension -eq '.exe' -and $_.BaseName -match '^(setup|install|setupchipset|setupserialio|meisetup|setupme|igxpin)([-_ ]?(x64|64|amd64))?$'
-            } | Sort-Object { $_.FullName.Length } | Select-Object -First 1
+            $installer = Find-DriverInstaller -Files $files
             if (-not $installer) {
                 $installer = $files | Where-Object Extension -eq '.msi' |
                              Sort-Object { $_.FullName.Length } | Select-Object -First 1
@@ -943,21 +1240,7 @@ function Invoke-DriverInstall {
             if ($installer) {
                 return (Invoke-DriverInstall -FilePath $installer.FullName -DriverDir $DriverDir)
             } elseif ($files | Where-Object Extension -eq '.inf') {
-                $infPattern = Join-Path $extractDir '*.inf'
-                $output = @(& pnputil.exe /add-driver $infPattern /subdirs /install | ForEach-Object {
-                    if ($_ -ne '') {
-                        Write-Log -Level INFO -Message $_
-                        $_
-                    }
-                })
-                $exitCode = $LASTEXITCODE
-                if ($exitCode -eq 259 -and
-                    ($output -match '已成功添加驱动程序包|Driver package added successfully|already in the driver store') -and
-                    -not ($output -match '添加驱动程序包失败|无法添加驱动程序包|安装驱动程序包失败|Failed to (add|install) driver package|Error (adding|installing) driver package')) {
-                    Write-Log -Level INFO -Message 'PnPUtil 已处理驱动包。部分驱动没有匹配设备，或设备已有同等或更合适的驱动。'
-                    return 'PnPProcessed'
-                }
-                Complete-DriverInstall -Name 'pnputil' -ExitCode $exitCode
+                return (Install-DriverInf -Path (Join-Path $extractDir '*.inf') -Recursive)
             } else {
                 throw '压缩包内未找到已识别的安装程序或 INF 文件。'
             }
@@ -979,6 +1262,7 @@ function Invoke-DriverInstall {
         }
         return
     }
+    if ($extension -eq '.inf') { return (Install-DriverInf -Path $FilePath) }
 
     $workingDir = Split-Path -LiteralPath $FilePath
     $name = [IO.Path]::GetFileName($FilePath)
@@ -1035,13 +1319,13 @@ function Invoke-DriverInstall {
 # ═══════════════════════════════════════════════════════════
 
 function Prompt-Reboot {
-    param([bool]$DriverFailed)
+    param([bool]$PackageFailed)
 
     Write-Section '完成'
     Write-Host "日志已保存至：$LogFile" -ForegroundColor Cyan
     if ($script:NeedReboot) {
-        if ($DriverFailed) {
-            Write-Host '本次驱动任务有失败项，已应用的部分更改需要重启才能完全生效。' -ForegroundColor Yellow
+        if ($PackageFailed) {
+            Write-Host '本次补丁或驱动任务有未完成项，已应用的部分更改需要重启才能完全生效。' -ForegroundColor Yellow
         } else {
             Write-Host '所选任务已处理完毕，需要重启才能完全生效。' -ForegroundColor Yellow
         }
@@ -1053,7 +1337,7 @@ function Prompt-Reboot {
             Write-Log -Level INFO -Message '用户选择稍后重启'
             Write-Host '请稍后手动重启以使所有设置生效。' -ForegroundColor Yellow
         }
-    } elseif (-not $DriverFailed) {
+    } elseif (-not $PackageFailed) {
         Write-Host '所有设置已生效，无需重启。' -ForegroundColor Green
     }
     return $false
@@ -1070,19 +1354,25 @@ function Main {
 
 用法：
   .\WinUpdateTool.ps1                不带参数，全量执行所有模块
-  .\WinUpdateTool.ps1 -Patch         仅安装 Windows 系统补丁
+  .\WinUpdateTool.ps1 -Patch         仅安装 WinPatches 中的离线补丁
   .\WinUpdateTool.ps1 -USB           仅关闭 USB 节能、USB 重定向及系统睡眠/休眠
-  .\WinUpdateTool.ps1 -Driver        下载并安装适用包，按需打开 ADLINK 登录窗口
-  .\WinUpdateTool.ps1 -Driver -AdlinkPassword  在查询驱动目录前打开 ADLINK 登录窗口
-  .\WinUpdateTool.ps1 -Driver -AdlinkLogin  使用已登录的 ADLINK 浏览器会话下载
+  .\WinUpdateTool.ps1 -Driver        仅安装 Drivers 中的离线驱动和软件包
   .\WinUpdateTool.ps1 -Rollback      回退 USB 节能、USB 重定向及睡眠设置（恢复默认值）
   .\WinUpdateTool.ps1 -Help          显示此帮助信息（也可用 -h 或 -?）
 
-参数可组合，例如：
-  .\WinUpdateTool.ps1 -Patch -Driver  只打补丁 + 装驱动，跳过 USB/睡眠设置
+离线目录可通过参数指定。
+  .\WinUpdateTool.ps1 -Patch -PatchPath "D:\离线补丁"
+  .\WinUpdateTool.ps1 -Driver -DriverPath "D:\离线驱动"
+
+-Online 对选中的补丁和驱动模块启用联网安装。
+  .\WinUpdateTool.ps1 -Online
+  .\WinUpdateTool.ps1 -Patch -Online
+  .\WinUpdateTool.ps1 -Driver -Online
+  .\WinUpdateTool.ps1 -Driver -Online -AdlinkPassword
+  .\WinUpdateTool.ps1 -Driver -Online -AdlinkLogin
 
 注意：
-  - 适用型号见同目录的 支持产品.psd1
+  - 在线驱动适用型号见同目录的 支持产品.psd1
   - 需以管理员身份运行
   - 如遇 PowerShell 执行策略限制，可用 .\WinUpdateTool.cmd 传入相同参数
   - 日志输出至脚本同级目录 optimize_log.txt
@@ -1091,19 +1381,58 @@ function Main {
         exit 0
     }
 
+    $runAll = -not ($Patch -or $USB -or $Driver -or $Rollback)
+    $runPatch = -not $Rollback -and ($runAll -or $Patch)
+    $runDriver = -not $Rollback -and ($runAll -or $Driver)
+
+    if ($Online -and ($PatchPath -or $DriverPath)) {
+        Write-Host '请选择在线或离线安装。使用 -Online 时请移除 -PatchPath 和 -DriverPath。' -ForegroundColor Red
+        exit 1
+    }
+    if (($AdlinkPassword -or $AdlinkLogin) -and -not ($Online -and $runDriver)) {
+        Write-Host 'ADLINK 登录选项需要在线驱动安装。请使用 -Driver -Online。' -ForegroundColor Red
+        exit 1
+    }
+    $offlineDirectories = @{}
+    if (-not $Online) {
+        $requiredDirectories = @(
+            if ($runPatch) {
+                @{ Parameter = 'PatchPath'; Value = $PatchPath; Folder = 'WinPatches'; Switch = '-Patch'; Content = '离线补丁包（MSU 或 CAB）' }
+            }
+            if ($runDriver) {
+                @{ Parameter = 'DriverPath'; Value = $DriverPath; Folder = 'Drivers'; Switch = '-Driver'; Content = '离线驱动和软件包（ZIP、EXE、MSI 或 INF）' }
+            }
+        )
+        $missingDirectory = $false
+        foreach ($directory in $requiredDirectories) {
+            $path = $directory.Value
+            if (-not $path) { $path = Join-Path $ScriptDir $directory.Folder }
+            $item = Get-Item -LiteralPath $path -ErrorAction SilentlyContinue
+            if ($item -isnot [IO.DirectoryInfo]) {
+                Write-Host "[INFO] 目录不存在或不可访问。$path"
+                Write-Host ('       请创建该目录并复制{0}，或通过 {1} -{2} "<现有目录>" 指定目录。' -f
+                    $directory.Content, $directory.Switch, $directory.Parameter)
+                $missingDirectory = $true
+                continue
+            }
+            $offlineDirectories[$directory.Parameter] = $item.FullName
+            if ($directory.Value) { $script:PSBoundParameters[$directory.Parameter] = $item.FullName }
+        }
+        if ($missingDirectory) { exit 1 }
+    }
+
     Assert-Admin
 
     Write-Host ''
     Write-Host '==================================================' -ForegroundColor White
     Write-Host '   WinUpdateTool v3.1' -ForegroundColor White
-    Write-Host '   适用型号见 支持产品.psd1 · 纯 PowerShell · 零第三方依赖' -ForegroundColor DarkGray
+    Write-Host '   纯 PowerShell · 零第三方依赖' -ForegroundColor DarkGray
     Write-Host '==================================================' -ForegroundColor White
 
     if (-not (Test-Path $LogFile)) {
         New-Item -Path $LogFile -ItemType File -Force | Out-Null
     }
 
-    $runAll      = -not ($Patch -or $USB -or $Driver -or $Rollback)
     $modeDisplay = if ($runAll)       { '全量执行' }
                    elseif ($Rollback) { '回退模式' }
                    else {
@@ -1117,29 +1446,49 @@ function Main {
     Write-Log -Level INFO -Message "========== 脚本启动 [$modeDisplay] =========="
     Write-Log -Level OK -Message '管理员权限验证通过'
 
-    try {
-        $products = Import-PowerShellDataFile -LiteralPath (Join-Path $ScriptDir '支持产品.psd1')
-        $product = Test-ProductModel -Products $products
-        $productId = [int]$products[$product]
-        if ($productId -le 0) { throw "型号 $product 的 ADLINK pdNo 必须为正整数。" }
-    } catch {
-        Write-Log -Level ERROR -Message "读取产品映射失败：$($_.Exception.Message)"
-        exit 1
+    if ($Online -and $runDriver) {
+        try {
+            $products = Import-PowerShellDataFile -LiteralPath (Join-Path $ScriptDir '支持产品.psd1')
+            $product = Test-ProductModel -Products $products
+            $productId = [int]$products[$product]
+            if ($productId -le 0) { throw "型号 $product 的 ADLINK pdNo 必须为正整数。" }
+        } catch {
+            Write-Log -Level ERROR -Message "读取产品映射失败：$($_.Exception.Message)"
+            exit 1
+        }
     }
 
-    $driverFailed = $false
+    $packageFailed = $false
     if ($Rollback) {
         Invoke-Rollback
     } else {
-        if ($runAll -or $Patch)  { Install-WindowsPatches  }
+        if ($runPatch) {
+            try {
+                $patchOk = if ($Online) { Install-WindowsPatches } else { Install-OfflineWindowsPatches -Path $offlineDirectories.PatchPath }
+                $packageFailed = -not $patchOk
+            } catch {
+                $packageFailed = $true
+                Write-Log -Level WARN -Message "补丁任务未完成。$($_.Exception.Message)"
+            }
+        }
         if ($runAll -or $USB)    { Invoke-UsbSleepDisable  }
-        if ($runAll -or $Driver) { $driverFailed = -not (Install-AdlinkPackages -Product $product -ProductId $productId) }
+        if ($runDriver) {
+            try {
+                $driverOk = if ($Online) { Install-AdlinkPackages -Product $product -ProductId $productId } else {
+                    Install-OfflineDrivers -Path $offlineDirectories.DriverPath
+                }
+                $packageFailed = $packageFailed -or -not $driverOk
+            } catch {
+                $packageFailed = $true
+                Write-Log -Level WARN -Message "驱动任务未完成。$($_.Exception.Message)"
+            }
+        }
     }
 
-    $restartNow = Prompt-Reboot -DriverFailed $driverFailed
+    $restartNow = Prompt-Reboot -PackageFailed $packageFailed
     Write-Log -Level INFO -Message '========== 脚本结束 =========='
     if ($restartNow) { Restart-Computer -Force }
-    if ($driverFailed) { exit 1 }
+    if ($packageFailed) { exit 1 }
 }
 
 Main

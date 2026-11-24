@@ -2,5 +2,8 @@
 optimize_log.txt
 # 驱动下载临时目录
 _drivers/
+# 离线安装包
+/Drivers/
+/WinPatches/
 # Office 临时文件
 ~$*

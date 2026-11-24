@@ -6,11 +6,11 @@ WinUpdateTool 是面向 ADLINK 工控机的 Windows PowerShell 优化工具，�
 
 - Windows 10 或 Windows 11，使用系统自带的 Windows PowerShell 5.1。
 - 运行需要本地管理员权限。当前终端权限不足时，脚本会请求管理员授权。
-- 安装更新时需能访问 Windows Update 或企业 WSUS。驱动模块需访问 ADLINK 官网获取适用的软件包清单。
+- 在线安装补丁需访问 Windows Update 或企业 WSUS，在线安装驱动需访问 ADLINK 官网。
 
 ## 快速开始
 
-下载或克隆仓库，在项目目录打开 PowerShell，通过 `WinUpdateTool.cmd` 启动。启动器的 PowerShell 执行策略仅对本次进程生效。
+将离线补丁复制到脚本同级的 `WinPatches`，将离线驱动和软件包复制到同级的 `Drivers`。在项目目录打开 PowerShell，通过 `WinUpdateTool.cmd` 启动。若所选模块需要的目录不存在，脚本会在安装前提示创建目录、复制安装包，或指定现有目录。
 
 ```powershell
 .\WinUpdateTool.cmd
@@ -18,15 +18,25 @@ WinUpdateTool 是面向 ADLINK 工控机的 Windows PowerShell 优化工具，�
 
 | 命令 | 执行内容 |
 | --- | --- |
-| `.\WinUpdateTool.cmd` | 依次安装 Windows 更新、应用 USB 和电源设置、处理驱动与软件包 |
-| `.\WinUpdateTool.cmd -Patch` | 安装 Windows 更新 |
+| `.\WinUpdateTool.cmd` | 依次安装离线补丁、应用 USB 和电源设置、安装离线驱动与软件包 |
+| `.\WinUpdateTool.cmd -Patch` | 安装 `WinPatches` 中适用于本机的补丁 |
+| `.\WinUpdateTool.cmd -Patch -PatchPath "D:\离线补丁"` | 安装指定目录中的补丁 |
 | `.\WinUpdateTool.cmd -USB` | 关闭 RemoteFX USB 重定向和 USB 节能，调整当前电源计划的睡眠、休眠等设置 |
-| `.\WinUpdateTool.cmd -Driver` | 下载并安装匹配的驱动与软件包 |
-| `.\WinUpdateTool.cmd -Patch -Driver` | 安装 Windows 更新、驱动与软件包 |
+| `.\WinUpdateTool.cmd -Driver` | 安装 `Drivers` 中的驱动与软件包 |
+| `.\WinUpdateTool.cmd -Driver -DriverPath "D:\离线驱动"` | 安装指定目录中的驱动与软件包 |
+| `.\WinUpdateTool.cmd -Patch -Online` | 通过 Windows Update 或企业 WSUS 安装补丁 |
+| `.\WinUpdateTool.cmd -Driver -Online` | 从 ADLINK 官网匹配、下载并安装驱动与软件包 |
+| `.\WinUpdateTool.cmd -Online` | 全量执行，补丁与驱动模块使用在线模式 |
 | `.\WinUpdateTool.cmd -Rollback` | 将 USB 和电源设置恢复为脚本预设的默认值 |
 | `.\WinUpdateTool.cmd -Help` | 查看参数说明 |
 
-## 驱动与软件包
+## 离线安装
+
+补丁模块递归读取 MSU 和 CAB 包，按包元数据安排服务堆栈和累积更新的顺序，由 Windows 判定适用性和已安装状态。安装前置补丁后会重试可继续处理的包。如果某个补丁需要等到重启后才能继续，重启后重新运行原命令。可在补丁目录放置 `Dependencies.psd1` 声明额外的安装依赖，格式见实现方案。[实现方案.md](./实现方案.md)
+
+驱动模块处理 ZIP、EXE、MSI 和 INF。解压后的安装包可放在各自的子目录中，脚本会识别常见的主安装程序。
+
+## 在线驱动与软件包
 
 脚本从 BIOS 的 `SMBIOSBIOSVersion` 读取型号。例如 `IMB-C47_2.00.10` 会解析为 `IMB-C47`，并在 `支持产品.psd1` 中匹配到 ADLINK 产品编号 `2184`。新增同类产品时，可在映射文件中添加一行型号和对应的官网 `pdNo`。[支持产品.psd1](./支持产品.psd1)
 
@@ -38,7 +48,7 @@ Windows 10 匹配官网的 `Windows 10` 和 `Windows 10\11` 分类。Windows 11 
 
 ## 日志与重启
 
-主日志位于脚本同目录的 `optimize_log.txt`。下载缓存和 Intel ME、SerialIO 安装日志位于 `_drivers`。查看安装结果时，以主日志的最终汇总及相应安装程序的日志为准。
+主日志位于脚本同目录的 `optimize_log.txt`。在线下载缓存和 Intel ME、SerialIO 安装日志位于 `_drivers`。查看安装结果时，以主日志的最终汇总及相应安装程序的日志为准。
 
 如果所选操作产生待重启的更改，脚本会在任务处理完毕后统一询问是否重启。输入 `Y` 立即重启，输入 `N` 或直接回车留到稍后。
 
