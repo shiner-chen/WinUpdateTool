@@ -1,13 +1,15 @@
 ﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
-    引望客户系统优化一键脚本（仅适用于 IMB-C47）v3.1
+    引望客户系统优化一键脚本 v3.1
 .DESCRIPTION
     默认全量执行；通过参数可单独运行某个模块；支持回退 USB/睡眠设置。
 
       -Patch          仅执行系统补丁安装
       -USB            仅执行关闭 USB 节能、重定向及系统睡眠
       -Driver         仅执行驱动包下载与安装
+      -AdlinkLogin    提示输入已登录的 ADLINK 浏览器会话 Cookie
+      -AdlinkPassword 在查询驱动目录前打开 ADLINK 登录窗口
       -Rollback       回退 USB 节能、USB 重定向及睡眠设置（恢复默认值）
       -Help / -h / -? 显示帮助信息
       （不传参数时全量执行 Patch + USB + Driver）
@@ -20,6 +22,8 @@ param(
     [switch]$Patch,
     [switch]$USB,
     [switch]$Driver,
+    [switch]$AdlinkLogin,
+    [switch]$AdlinkPassword,
     [switch]$Rollback,
     [Alias('h','?')]
     [switch]$Help
@@ -79,9 +83,9 @@ function Get-RegPolContent {
 
 function Remove-RegPolRecord {
     param([byte[]]$Bytes, [string]$Key, [string]$ValueName)
+    if ($Bytes.Length -eq 8) { return $Bytes }
     $hdr        = $Bytes[0..7]
-    $body       = if ($Bytes.Length -gt 8) { $Bytes[8..($Bytes.Length - 1)] } else { [byte[]]@() }
-    $unicode    = [System.Text.Encoding]::Unicode.GetString($body)
+    $unicode    = [System.Text.Encoding]::Unicode.GetString($Bytes, 8, $Bytes.Length - 8)
     $pattern    = '\[' + [regex]::Escape($Key + [char]0) + ';' + [regex]::Escape($ValueName + [char]0) + ';[^\]]*\]'
     $cleaned    = [regex]::Replace($unicode, $pattern, '')
     $cleanBytes = [System.Text.Encoding]::Unicode.GetBytes($cleaned)
@@ -171,39 +175,47 @@ function Assert-Admin {
         [Security.Principal.WindowsBuiltInRole]::Administrator)
     if (-not $isAdmin) {
         Write-Warning '需要管理员权限，正在以管理员身份重新启动脚本...'
+        $switchArgs = foreach ($name in $script:PSBoundParameters.Keys) {
+            if ($script:PSBoundParameters[$name]) { "-$name" }
+        }
         $fwdArgs = '-NoProfile -ExecutionPolicy Bypass -File "{0}" {1}' -f `
-            $MyInvocation.MyCommand.Definition, ($MyInvocation.Line -replace '^[^-]*','')
-        Start-Process powershell -ArgumentList $fwdArgs -Verb RunAs
-        exit
+            $PSCommandPath, ($switchArgs -join ' ')
+        $powershell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        $process = Start-Process -FilePath $powershell -ArgumentList $fwdArgs -Verb RunAs -Wait -PassThru
+        exit $process.ExitCode
     }
-    Write-Log -Level OK -Message '管理员权限验证通过'
 }
 
 # ═══════════════════════════════════════════════════════════
-# Module 0b：产品型号检测（仅 IMB-C47 继续执行）
+# Module 0b：产品型号检测
 # ═══════════════════════════════════════════════════════════
 
 function Test-ProductModel {
+    param([hashtable]$Products)
     Write-Section '产品型号检测'
-    $product = $null
     try {
-        $product = (Get-WmiObject -Class Win32_ComputerSystemProduct -ErrorAction Stop).Name
+        $biosVersion = Get-CimInstance -ClassName Win32_BIOS -Property SMBIOSBIOSVersion -ErrorAction Stop |
+                       Select-Object -ExpandProperty SMBIOSBIOSVersion
     } catch {
-        try {
-            $product = (Get-CimInstance -ClassName Win32_ComputerSystemProduct -ErrorAction Stop).Name
-        } catch {
-            Write-Log -Level ERROR -Message "无法读取产品型号：$($_.Exception.Message)"
-            exit 1
-        }
+        Write-Log -Level ERROR -Message "无法读取 SMBIOSBIOSVersion，脚本退出。$($_.Exception.Message)"
+        exit 1
     }
+
+    $biosVersion = "$biosVersion".Trim()
+    Write-Log -Level INFO -Message "SMBIOSBIOSVersion：'$biosVersion'"
+    if ($biosVersion -notmatch '\A(?<Product>[^_\s]+)_\S+\z') {
+        Write-Log -Level ERROR -Message 'BIOS 版本格式应为“产品型号_版本号”，无法解析产品型号，脚本退出。'
+        exit 1
+    }
+
+    $product = $Matches.Product
     Write-Log -Level INFO -Message "当前产品型号：$product"
-    if ($product -notlike '*IMB-C47*') {
-        Write-Log -Level ERROR -Message "产品型号不匹配（期望 IMB-C47，实际 $product），脚本退出。"
-        Write-Host "`n[错误] 本脚本仅适用于 IMB-C47，当前型号为：$product" -ForegroundColor Red
-        Write-Host "       脚本已退出，不做任何修改。`n" -ForegroundColor Red
+    if (-not $Products.ContainsKey($product)) {
+        Write-Log -Level ERROR -Message "型号 $product 未列在支持产品.psd1 中，脚本退出。"
         exit 1
     }
     Write-Log -Level OK -Message "型号验证通过：$product"
+    return $product
 }
 
 # ═══════════════════════════════════════════════════════════
@@ -541,112 +553,481 @@ function Invoke-Rollback {
 }
 
 # ═══════════════════════════════════════════════════════════
-# Module 5：IMB-C47 驱动包自动下载并安装
+# Module 5：ADLINK 驱动和软件包下载与安装
 # ═══════════════════════════════════════════════════════════
 
-function Install-ImbC47Drivers {
-    Write-Section 'IMB-C47 驱动包下载与安装'
+function Connect-AdlinkAccount {
+    param([uri]$Origin, [int]$ProductId, $Session)
 
-    $driverDir = Join-Path $ScriptDir '_drivers'
-    if (-not (Test-Path $driverDir)) {
-        New-Item -ItemType Directory -Path $driverDir -Force | Out-Null
+    $catalog = [uri]::new($Origin, "/Products/DownloadSoftwareDriver.aspx?lang=zh_cn&pdNo=$ProductId&kind=DR")
+    $loginPath = '/Member/SignInDriver.aspx'
+    $loginPage = [uri]::new($Origin, "$($loginPath)?lang=zh_cn&referURL=$([uri]::EscapeDataString($catalog.AbsoluteUri))")
+    $html = (Invoke-WebRequest -Uri $loginPage -WebSession $Session -UseBasicParsing -TimeoutSec 60).Content
+    $form = [regex]::Match($html, '(?is)<form\b(?<attributes>[^>]*\bid\s*=\s*["'']form1["''][^>]*)>(?<inputs>.*?)</form>')
+    $action = [regex]::Match($form.Groups['attributes'].Value, '(?i)\baction\s*=\s*["'']([^"'']+)["'']')
+    if (-not $action.Success) { throw '无法识别 ADLINK 登录表单，请使用浏览器登录。' }
+    $submitUrl = [uri]::new($loginPage, [Net.WebUtility]::HtmlDecode($action.Groups[1].Value))
+    if ($submitUrl.Scheme -ne 'https' -or $submitUrl.Authority -ne $Origin.Authority -or $submitUrl.AbsolutePath -ne $loginPath) {
+        throw 'ADLINK 登录表单地址已变更，请使用浏览器登录。'
     }
 
-    $pageUrl = 'https://www.adlinktech.com.cn/Products/DownloadSoftwareDriver.aspx?lang=zh_cn&pdNo=2184&kind=DR'
-    Write-Log -Level INFO -Message "正在解析驱动下载页面：$pageUrl"
-
-    $links = @()
-    try {
-        $resp  = Invoke-WebRequest -Uri $pageUrl -UseBasicParsing -TimeoutSec 60
-        $hrefs = ($resp.Links | Where-Object { $_.href -match '\.(zip|exe|msi)(\?.*)?$' }).href
-        foreach ($h in $hrefs) {
-            if ($h -match '^http')  { $links += $h }
-            elseif ($h -match '^/') { $links += "https://www.adlinktech.com.cn$h" }
+    $userField = 'ctl00$CPContens$loginBox$emailBoxId'
+    $passwordField = 'ctl00$CPContens$loginBox$passwordBoxId'
+    $submitField = 'ctl00$CPContens$loginBox$loginBtn'
+    $body = @{}
+    $fields = @{}
+    foreach ($inputTag in [regex]::Matches($form.Groups['inputs'].Value, '(?is)<input\b[^>]*>')) {
+        $attribute = @{}
+        foreach ($match in [regex]::Matches($inputTag.Value, '(?i)\b(name|type|value)\s*=\s*(?:"([^"]*)"|''([^'']*)'')')) {
+            $value = if ($match.Groups[2].Success) { $match.Groups[2].Value } else { $match.Groups[3].Value }
+            $attribute[$match.Groups[1].Value] = [Net.WebUtility]::HtmlDecode($value)
         }
-        if ($links.Count -eq 0) {
-            $m2 = [regex]::Matches($resp.Content, 'href="([^"]+\.(zip|exe|msi)[^"]*)"')
-            foreach ($m in $m2) {
-                $href = $m.Groups[1].Value
-                if ($href -match '^http')  { $links += $href }
-                elseif ($href -match '^/') { $links += "https://www.adlinktech.com.cn$href" }
+        $name = $attribute['name']
+        if (-not $name) { continue }
+        $fields[$name] = $attribute['type']
+        if ($attribute['type'] -eq 'hidden' -or $name -eq $submitField) { $body[$name] = [string]$attribute['value'] }
+    }
+    if (-not $body.ContainsKey('__VIEWSTATE') -or $fields[$userField] -ne 'text' -or
+        $fields[$passwordField] -ne 'password' -or $fields[$submitField] -ne 'submit') {
+        throw 'ADLINK 登录表单字段已变更，请使用浏览器登录。'
+    }
+
+    $credential = Get-Credential -Message '登录 ADLINK 官网下载驱动。请输入 ADLINK 账号邮箱和密码。'
+    if ($null -eq $credential) { throw '已取消 ADLINK 登录。' }
+
+    $email = $credential.UserName.Trim()
+    $password = $credential.Password
+    $payload = $null
+    try {
+        if (-not $email -or $password.Length -eq 0) { throw '请输入 ADLINK 登录邮箱和密码。' }
+        $body[$userField] = $email
+        $body[$passwordField] = [Net.NetworkCredential]::new($email, $password).Password
+        $encodedFields = foreach ($field in $body.GetEnumerator()) {
+            '{0}={1}' -f [Net.WebUtility]::UrlEncode([string]$field.Key), [Net.WebUtility]::UrlEncode([string]$field.Value)
+        }
+        $payload = [Text.Encoding]::UTF8.GetBytes(($encodedFields -join '&'))
+        try {
+            $request = [Net.HttpWebRequest][Net.WebRequest]::Create($submitUrl)
+            $request.Method = 'POST'
+            $request.AllowAutoRedirect = $false
+            $request.ContentType = 'application/x-www-form-urlencoded'
+            $request.ContentLength = $payload.Length
+            $request.CookieContainer = $Session.Cookies
+            $request.UserAgent = $Session.UserAgent
+            $request.Referer = $loginPage.AbsoluteUri
+            $request.Timeout = 60000
+            $request.ReadWriteTimeout = 60000
+            $stream = $request.GetRequestStream()
+            try { $stream.Write($payload, 0, $payload.Length) } finally { $stream.Dispose() }
+            $response = $request.GetResponse()
+            $response.Dispose()
+        } catch {
+            throw '无法提交 ADLINK 登录表单，请检查网络或在浏览器登录。'
+        }
+    } finally {
+        $body.Clear()
+        $encodedFields = $null
+        if ($payload) { [Array]::Clear($payload, 0, $payload.Length) }
+        $password.Dispose()
+    }
+}
+
+function Get-AdlinkPackages {
+    param([int]$ProductId, [string]$Windows, [uri]$Origin, $Session, [switch]$RequireLogin)
+
+    $endpoint = [uri]::new($Origin, '/Products/DownloadSoftData.ashx')
+    $compatibleCategories = @($Windows, 'Windows 10\11')
+    foreach ($kind in 'DR', 'SW') {
+        $page = [uri]::new($Origin, "/Products/DownloadSoftwareDriver.aspx?lang=zh_cn&pdNo=$ProductId&kind=$kind")
+        $html = (Invoke-WebRequest -Uri $page -WebSession $Session -UseBasicParsing -TimeoutSec 60).Content
+        $osSelect = [regex]::Match($html, '(?is)<select\b[^>]*\bid\s*=\s*["'']CPContens_DropDownList1["''][^>]*>(.*?)</select>')
+        if (-not $osSelect.Success) { throw "官网 $kind 目录缺少操作系统分类。$page" }
+
+        $loginField = [regex]::Match($html, '(?is)<input\b[^>]*\bid\s*=\s*["'']CPContens_hf_IsLogin["''][^>]*>')
+        $login = if ($loginField.Value -match '\bvalue\s*=\s*["'']Y["'']') { 'Y' } else { 'N' }
+        if ($kind -eq 'DR' -and $RequireLogin) {
+            if ($login -ne 'Y') {
+                throw [System.Security.Authentication.AuthenticationException]::new('ADLINK 未确认登录成功。请核对邮箱和密码，或在浏览器完成验证后使用 -AdlinkLogin。')
+            }
+            Write-Log -Level OK -Message 'ADLINK 官网登录成功'
+        }
+        $categories = @(
+            foreach ($option in [regex]::Matches($osSelect.Groups[1].Value, '(?i)<option\b[^>]*\bvalue\s*=\s*["'']([^"'']+)["'']')) {
+                $category = [Net.WebUtility]::HtmlDecode($option.Groups[1].Value).Trim()
+                if ($category -in $compatibleCategories -or $category -eq 'All') { $category }
+            }
+        )
+        foreach ($category in ($categories | Select-Object -Unique)) {
+            $encodedCategory = [uri]::EscapeDataString($category)
+            $query = "$($endpoint.AbsoluteUri)?pdNo=$ProductId&kind=$kind&OS=$encodedCategory&lang=zh_cn&MainCategory="
+            Write-Log -Level INFO -Message "查询 ADLINK $kind 分类：$category"
+            $response = Invoke-WebRequest -Uri $query -WebSession $Session -UseBasicParsing -TimeoutSec 60
+            if ([string]::IsNullOrWhiteSpace($response.Content)) { continue }
+            $items = ConvertFrom-Json -InputObject $response.Content
+            foreach ($item in $items) {
+                $spec = if ($item.PSObject.Properties['Spec']) { "$($item.Spec)".Trim() }
+                if ($spec -and $spec -notin $compatibleCategories -and $spec -notin @('All', 'Windows')) { continue }
+
+                $id = [int]$item.ID
+                $size = [long]$item.FileSize
+                $fileName = [IO.Path]::GetFileName([string]$item.FileName)
+                $driverType = if ($item.PSObject.Properties['DriverType']) { [string]$item.DriverType }
+                if ($id -le 0 -or $size -le 0 -or -not $fileName -or $fileName -in @('.', '..') -or
+                    $fileName.IndexOfAny([IO.Path]::GetInvalidFileNameChars()) -ge 0) {
+                    throw "官网 $kind 分类 $category 包含无效的文件信息。"
+                }
+                [pscustomobject]@{
+                    Kind       = $kind
+                    Id         = $id
+                    Name       = [Net.WebUtility]::HtmlDecode([string]$item.Description).Trim()
+                    Category   = $category
+                    DriverType = $driverType
+                    FileName   = $fileName
+                    Size       = $size
+                    CatalogUrl = $page
+                    Url        = [uri]"$($endpoint.AbsoluteUri)?pdNo=$ProductId&type=$kind&id=$id&isLogin=$login&lang=zh_cn&MainCategory="
+                }
             }
         }
-        Write-Log -Level INFO -Message "解析到 $($links.Count) 个驱动下载链接"
-    } catch {
-        Write-Log -Level ERROR -Message "页面解析失败：$($_.Exception.Message)"
-        Write-Log -Level WARN  -Message "驱动模块已跳过，请手动前往官网下载：$pageUrl"
-        return
     }
+}
 
-    if ($links.Count -eq 0) {
-        Write-Log -Level WARN -Message '未解析到驱动链接（页面可能使用 JS 动态加载），请手动下载。'
-        Write-Log -Level INFO -Message "官网地址：$pageUrl"
-        return
-    }
+function Save-AdlinkPackage {
+    param(
+        $Package,
+        [string]$Destination,
+        [string[]]$LocalDirectories,
+        $Session,
+        [int]$PackageNumber,
+        [int]$PackageCount
+    )
 
-    foreach ($url in ($links | Select-Object -Unique)) {
-        $fileName = [System.IO.Path]::GetFileName(($url -split '\?')[0])
-        $destFile = Join-Path $driverDir $fileName
-        Write-Log -Level INFO -Message "下载：$fileName"
-        try {
-            $wc = New-Object System.Net.WebClient
-            $wc.DownloadFile($url, $destFile)
-            Write-Log -Level OK -Message "下载完成：$fileName"
-        } catch {
-            Write-Log -Level ERROR -Message "下载失败 [$fileName]：$($_.Exception.Message)"
-            continue
+    $localPaths = @($Destination) + @(foreach ($directory in $LocalDirectories) { Join-Path $directory $Package.FileName })
+    foreach ($path in $localPaths) {
+        $file = Get-Item -LiteralPath $path -ErrorAction SilentlyContinue
+        if ($file -isnot [IO.FileInfo]) { continue }
+        if ($file.Length -eq $Package.Size) {
+            Write-Log -Level INFO -Message "[$PackageNumber/$PackageCount] 使用本地安装包：$path"
+            return $file.FullName
         }
-        Invoke-DriverInstall -FilePath $destFile -DriverDir $driverDir
+        Write-Log -Level INFO -Message "本地安装包大小与目录不符：$path"
+    }
+    Write-Log -Level INFO -Message "[$PackageNumber/$PackageCount] 本地无匹配安装包，开始下载 $($Package.Name)。"
+
+    $partial = "$Destination.$([guid]::NewGuid().ToString('N')).partial"
+    $url = $Package.Url
+    $activity = '下载驱动及软件包'
+    $status = "[$PackageNumber/$PackageCount] $($Package.Name)"
+    try {
+        Write-Progress -Activity $activity -Status $status -CurrentOperation '正在连接下载服务器' -PercentComplete 0
+        for ($redirect = 0; $redirect -le 8; $redirect++) {
+            if ($url.Scheme -ne 'https') { throw "官网返回了非 HTTPS 下载地址。" }
+            if ($url.AbsolutePath -match '/Member/(DialogLogin|SignIn)') {
+                throw [System.Security.Authentication.AuthenticationException]::new('ADLINK 下载仍要求登录。可在浏览器登录后使用 -AdlinkLogin，或将下载的文件放到上述本地路径。')
+            }
+            $request = [Net.HttpWebRequest][Net.WebRequest]::Create($url)
+            $request.AllowAutoRedirect = $false
+            $request.CookieContainer = $Session.Cookies
+            $request.UserAgent = $Session.UserAgent
+            $request.Referer = $Package.CatalogUrl.AbsoluteUri
+            $request.Timeout = 60000
+            $request.ReadWriteTimeout = 60000
+            $response = $request.GetResponse()
+            try {
+                if ([int]$response.StatusCode -in @(301, 302, 303, 307, 308)) {
+                    $url = [uri]::new($url, $response.Headers['Location'])
+                    continue
+                }
+                if ($response.ContentType -match '^(text/|application/(json|xhtml))') {
+                    throw "官网下载接口返回页面，无法取得 $($Package.FileName)。"
+                }
+                $inputStream = $response.GetResponseStream()
+                try {
+                    $outputStream = [IO.File]::Open($partial, [IO.FileMode]::CreateNew)
+                    try {
+                        $buffer = [byte[]]::new(128KB)
+                        $downloaded = 0L
+                        $updateTimer = [Diagnostics.Stopwatch]::StartNew()
+                        while (($bytesRead = $inputStream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                            $outputStream.Write($buffer, 0, $bytesRead)
+                            $downloaded += $bytesRead
+                            if ($updateTimer.ElapsedMilliseconds -ge 250) {
+                                $percent = [Math]::Min(99, [Math]::Floor(100.0 * $downloaded / $Package.Size))
+                                $transferred = '已下载 {0:N1} / {1:N1} MiB' -f ($downloaded / 1MB), ($Package.Size / 1MB)
+                                Write-Progress -Activity $activity -Status $status -CurrentOperation $transferred -PercentComplete $percent
+                                $updateTimer.Restart()
+                            }
+                        }
+                    } finally { $outputStream.Dispose() }
+                } finally { $inputStream.Dispose() }
+                break
+            } finally { $response.Dispose() }
+        }
+        if (-not (Test-Path -LiteralPath $partial -PathType Leaf)) { throw '官网下载地址重定向次数过多。' }
+        if ((Get-Item -LiteralPath $partial).Length -ne $Package.Size) {
+            throw "下载文件大小与目录不符，期望 $($Package.Size) 字节。"
+        }
+        Move-Item -LiteralPath $partial -Destination $Destination -Force
+        Write-Progress -Activity $activity -Status $status -CurrentOperation '下载完成' -PercentComplete 100
+        Write-Log -Level OK -Message "[$PackageNumber/$PackageCount] 下载完成：$($Package.Name)"
+        return $Destination
+    } finally {
+        Write-Progress -Activity $activity -Completed
+        [IO.File]::Delete($partial)
+    }
+}
+
+function Install-AdlinkPackages {
+    param([string]$Product, [int]$ProductId)
+
+    Write-Section "$Product 驱动及软件包下载与安装"
+    $origin = [uri]'https://www.adlinktech.com.cn/'
+    $session = New-Object Microsoft.PowerShell.Commands.WebRequestSession
+    $useAccountLogin = [bool]$AdlinkPassword
+    try {
+        $os = Get-CimInstance -ClassName Win32_OperatingSystem -Property Version,BuildNumber,ProductType -ErrorAction Stop
+        if ($os.ProductType -ne 1 -or [version]$os.Version -lt [version]'10.0' -or [int]$os.BuildNumber -lt 10240) {
+            throw "驱动目录支持 Windows 10 和 Windows 11 客户端。当前系统版本为 $($os.Version)。"
+        }
+        $windows = if ([int]$os.BuildNumber -ge 22000) { 'Windows 11' } else { 'Windows 10' }
+        Write-Log -Level INFO -Message "本机系统：$windows（Build $($os.BuildNumber)），产品目录 pdNo=$ProductId"
+
+        if ($AdlinkLogin -and $AdlinkPassword) { throw '请只选择一种 ADLINK 登录方式。' }
+        if ($useAccountLogin) {
+            Connect-AdlinkAccount -Origin $origin -ProductId $ProductId -Session $session
+        } elseif ($AdlinkLogin) {
+            $secureCookie = Read-Host '在 ADLINK 官网登录后，粘贴该站请求的 Cookie 值' -AsSecureString
+            $cookiePtr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureCookie)
+            try {
+                $cookieHeader = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($cookiePtr)
+                foreach ($pair in ($cookieHeader -split ';\s*')) {
+                    if ($pair -notmatch '\A([^=\s]+)=(.*)\z') { continue }
+                    $cookie = [Net.Cookie]::new($Matches[1], $Matches[2], '/')
+                    $cookie.Secure = $true
+                    $session.Cookies.Add($origin, $cookie)
+                }
+            } catch {
+                throw '无法读取 ADLINK 会话 Cookie，请粘贴该站请求的 Cookie 值。'
+            } finally {
+                [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($cookiePtr)
+                $cookieHeader = $null
+                $secureCookie.Dispose()
+            }
+        }
+    } catch {
+        Write-Log -Level WARN -Message "无法开始 ADLINK 驱动任务：$($_.Exception.Message)"
+        return $false
     }
 
-    Write-Log -Level OK -Message '驱动模块执行完毕'
+    $driverDirectory = Join-Path $ScriptDir '_drivers'
+    $productDirectory = Join-Path $driverDirectory $ProductId
+    $packageResults = @{}
+    :catalog while ($true) {
+        try {
+            $packages = @(Get-AdlinkPackages -ProductId $ProductId -Windows $windows -Origin $origin -Session $session -RequireLogin:$useAccountLogin |
+                          Sort-Object Kind, Id -Unique)
+            if ($packages.Count -eq 0) {
+                Write-Log -Level INFO -Message "官网目录没有适用于 $windows 的驱动或软件包。"
+                return $true
+            }
+            $packages = @($packages | Sort-Object Kind, @{ Expression = { $_.DriverType -ne 'Chipset' } }, Id)
+            Write-Log -Level INFO -Message "共找到 $($packages.Count) 个匹配包"
+        } catch [System.Security.Authentication.AuthenticationException] {
+            Write-Log -Level WARN -Message $_.Exception.Message
+            return $false
+        } catch {
+            Write-Log -Level ERROR -Message "读取 ADLINK 目录失败：$($_.Exception.Message)"
+            return $false
+        }
+        foreach ($package in $packages) {
+            Write-Log -Level INFO -Message "[$($package.Kind) / $($package.Category)] $($package.Name)"
+        }
+
+        $processed = 0
+        $packageNumber = 0
+        foreach ($package in $packages) {
+            $packageNumber++
+            $packageKey = "$($package.Kind)-$($package.Id)"
+            if ($packageResults.ContainsKey($packageKey)) {
+                if ($packageResults[$packageKey]) { $processed++ }
+                continue
+            }
+
+            $packageDir = Join-Path $productDirectory $packageKey
+            $destination = Join-Path $packageDir $package.FileName
+            try {
+                New-Item -ItemType Directory -Path $packageDir -Force | Out-Null
+                Write-Log -Level INFO -Message "准备安装 [$packageNumber/$($packages.Count)] $($package.Name)：$destination"
+                $packageFile = Save-AdlinkPackage -Package $package -Destination $destination -LocalDirectories @($productDirectory, $driverDirectory) -Session $session -PackageNumber $packageNumber -PackageCount $packages.Count
+            } catch {
+                if ($_.Exception -is [System.Security.Authentication.AuthenticationException] -and
+                    -not ($useAccountLogin -or $AdlinkLogin)) {
+                    try {
+                        Write-Log -Level INFO -Message 'ADLINK 要求登录，正在打开登录窗口。'
+                        Connect-AdlinkAccount -Origin $origin -ProductId $ProductId -Session $session
+                    } catch {
+                        Write-Log -Level WARN -Message "ADLINK 登录未完成：$($_.Exception.Message)"
+                        return $false
+                    }
+                    $useAccountLogin = $true
+                    continue catalog
+                }
+                $packageResults[$packageKey] = $false
+                Write-Log -Level ERROR -Message "无法获取 $($package.Name) 的安装包：$($_.Exception.Message) 官网：$($package.CatalogUrl)"
+                continue
+            }
+
+            try {
+                Write-Log -Level INFO -Message "正在安装 [$packageNumber/$($packages.Count)] $($package.Name)"
+                $installStatus = Invoke-DriverInstall -FilePath $packageFile -DriverDir $packageDir
+                $packageResults[$packageKey] = $true
+                $processed++
+                if ($installStatus -ne 'PnPProcessed') {
+                    Write-Log -Level OK -Message "安装完成：$($package.Name)"
+                }
+            } catch {
+                $packageResults[$packageKey] = $false
+                Write-Log -Level WARN -Message "安装 $($package.Name) 未完成：$($_.Exception.Message)"
+            }
+        }
+
+        $failed = $packages.Count - $processed
+        $level = if ($failed -eq 0) { 'OK' } else { 'WARN' }
+        Write-Log -Level $level -Message "驱动及软件包结果：已处理 $processed 个，未完成 $failed 个。"
+        return ($failed -eq 0)
+    }
+}
+
+function Complete-DriverInstall {
+    param([string]$Name, [int]$ExitCode)
+
+    switch ($ExitCode) {
+        0 { return }
+        3010 {
+            $script:NeedReboot = $true
+            Write-Log -Level INFO -Message "$Name 需要重启，已推迟到本次任务结束。"
+        }
+        1641 {
+            $script:NeedReboot = $true
+            # 1641 表示安装程序已发起重启。如果 Windows 仍允许取消，立即取消。
+            $shutdown = Join-Path $env:SystemRoot 'System32\shutdown.exe'
+            try {
+                $abort = Start-Process -FilePath $shutdown -ArgumentList '/a' -WindowStyle Hidden -Wait -PassThru
+                if ($abort.ExitCode -ne 0) { throw "shutdown.exe 退出码 $($abort.ExitCode)。" }
+                Write-Log -Level WARN -Message "$Name 发起的重启已取消，将继续处理后续安装包。"
+            } catch {
+                Write-Log -Level WARN -Message "$Name 返回 1641（已发起重启），Windows 未确认取消。$($_.Exception.Message)"
+            }
+        }
+        default { throw "$Name 退出码 $ExitCode。" }
+    }
 }
 
 function Invoke-DriverInstall {
     param([string]$FilePath, [string]$DriverDir)
-    $ext  = [System.IO.Path]::GetExtension($FilePath).ToLower()
-    $name = [System.IO.Path]::GetFileNameWithoutExtension($FilePath)
-    try {
-        if ($ext -eq '.zip') {
-            $extractDir = Join-Path $DriverDir $name
-            New-Item -ItemType Directory -Path $extractDir -Force | Out-Null
+
+    $extension = [IO.Path]::GetExtension($FilePath).ToLowerInvariant()
+    if ($extension -eq '.zip') {
+        $extractDir = Join-Path $DriverDir ([guid]::NewGuid().ToString('N'))
+        try {
             Add-Type -AssemblyName System.IO.Compression.FileSystem
             [System.IO.Compression.ZipFile]::ExtractToDirectory($FilePath, $extractDir)
-            Write-Log -Level INFO -Message "解压：$name"
-            $inner = Get-ChildItem $extractDir -Recurse -Include '*.exe','*.msi' |
-                     Sort-Object { if ($_.Name -match 'setup|install') { 0 } else { 1 } } |
-                     Select-Object -First 1
-            if ($inner) {
-                Invoke-DriverInstall -FilePath $inner.FullName -DriverDir $DriverDir
+            $files = @(Get-ChildItem -LiteralPath $extractDir -Recurse -File)
+            $installer = $files | Where-Object {
+                $_.Extension -eq '.exe' -and $_.BaseName -match '^(setup|install|setupchipset|setupserialio|meisetup|setupme|igxpin)([-_ ]?(x64|64|amd64))?$'
+            } | Sort-Object { $_.FullName.Length } | Select-Object -First 1
+            if (-not $installer) {
+                $installer = $files | Where-Object Extension -eq '.msi' |
+                             Sort-Object { $_.FullName.Length } | Select-Object -First 1
+            }
+            if ($installer) {
+                return (Invoke-DriverInstall -FilePath $installer.FullName -DriverDir $DriverDir)
+            } elseif ($files | Where-Object Extension -eq '.inf') {
+                $infPattern = Join-Path $extractDir '*.inf'
+                $output = @(& pnputil.exe /add-driver $infPattern /subdirs /install | ForEach-Object {
+                    if ($_ -ne '') {
+                        Write-Log -Level INFO -Message $_
+                        $_
+                    }
+                })
+                $exitCode = $LASTEXITCODE
+                if ($exitCode -eq 259 -and
+                    ($output -match '已成功添加驱动程序包|Driver package added successfully|already in the driver store') -and
+                    -not ($output -match '添加驱动程序包失败|无法添加驱动程序包|安装驱动程序包失败|Failed to (add|install) driver package|Error (adding|installing) driver package')) {
+                    Write-Log -Level INFO -Message 'PnPUtil 已处理驱动包。部分驱动没有匹配设备，或设备已有同等或更合适的驱动。'
+                    return 'PnPProcessed'
+                }
+                Complete-DriverInstall -Name 'pnputil' -ExitCode $exitCode
             } else {
-                Get-ChildItem $extractDir -Recurse -Filter '*.inf' | ForEach-Object {
-                    Write-Log -Level INFO -Message "pnputil 安装：$($_.Name)"
-                    & pnputil /add-driver $_.FullName /install | Out-Null
-                    Write-Log -Level OK -Message "pnputil 完成：$($_.Name)"
+                throw '压缩包内未找到已识别的安装程序或 INF 文件。'
+            }
+        } finally {
+            for ($attempt = 1; $attempt -le 3; $attempt++) {
+                try {
+                    if ([IO.Directory]::Exists($extractDir)) {
+                        [IO.Directory]::Delete($extractDir, $true)
+                    }
+                    break
+                } catch {
+                    if ($attempt -eq 3) {
+                        Write-Log -Level WARN -Message "未能清理解压目录，已保留 $extractDir。$($_.Exception.Message)"
+                    } else {
+                        Start-Sleep -Milliseconds 500
+                    }
                 }
             }
-        } elseif ($ext -eq '.exe') {
-            Write-Log -Level INFO -Message "静默安装(EXE)：$name"
-            $proc = Start-Process -FilePath $FilePath -ArgumentList '/s /norestart' -Wait -PassThru
-            if ($proc.ExitCode -notin @(0, 3010)) {
-                $proc = Start-Process -FilePath $FilePath -ArgumentList '/silent /norestart' -Wait -PassThru
-            }
-            $lvl = if ($proc.ExitCode -in @(0, 3010)) { 'OK' } else { 'WARN' }
-            Write-Log -Level $lvl -Message "安装结果(EXE) $name ExitCode=$($proc.ExitCode)"
-            if ($proc.ExitCode -eq 3010) { $script:NeedReboot = $true }
-        } elseif ($ext -eq '.msi') {
-            Write-Log -Level INFO -Message "静默安装(MSI)：$name"
-            $proc = Start-Process -FilePath 'msiexec.exe' `
-                        -ArgumentList "/i `"$FilePath`" /quiet /norestart" -Wait -PassThru
-            $lvl = if ($proc.ExitCode -in @(0, 3010)) { 'OK' } else { 'WARN' }
-            Write-Log -Level $lvl -Message "安装结果(MSI) $name ExitCode=$($proc.ExitCode)"
-            if ($proc.ExitCode -eq 3010) { $script:NeedReboot = $true }
-        } else {
-            Write-Log -Level WARN -Message "未知扩展名，跳过：$FilePath"
         }
-    } catch {
-        Write-Log -Level ERROR -Message "安装异常 [$name]：$($_.Exception.Message)"
+        return
     }
+
+    $workingDir = Split-Path -LiteralPath $FilePath
+    $name = [IO.Path]::GetFileName($FilePath)
+    Write-Log -Level INFO -Message "静默安装：$name"
+    switch ($extension) {
+        '.exe' {
+            $responseFile = Join-Path $workingDir 'setup.iss'
+            if ($name -eq 'Setup.exe' -and (Test-Path -LiteralPath $responseFile -PathType Leaf) -and
+                (Select-String -LiteralPath $responseFile -Pattern '^Company\s*=\s*Realtek\b' -Quiet)) {
+                $silentLog = Join-Path $DriverDir ("realtek-{0}.log" -f [guid]::NewGuid().ToString('N'))
+                try {
+                    $arguments = '/s /norestart /f1"{0}" /f2"{1}"' -f $responseFile, $silentLog
+                    $process = Start-Process -FilePath $FilePath -ArgumentList $arguments -WorkingDirectory $workingDir -Wait -PassThru
+                    Complete-DriverInstall -Name $name -ExitCode $process.ExitCode
+                    if (-not (Test-Path -LiteralPath $silentLog -PathType Leaf)) {
+                        throw 'Realtek 安装程序未生成静默安装结果日志。'
+                    }
+                    $result = Select-String -LiteralPath $silentLog -Pattern '^\s*ResultCode\s*=\s*(-?\d+)\s*$' |
+                              Select-Object -First 1
+                    if (-not $result -or $result.Matches[0].Groups[1].Value -ne '0') {
+                        $detail = if ($result) { $result.Line.Trim() } else { '缺少 ResultCode' }
+                        throw "Realtek 静默安装返回 $detail。"
+                    }
+                } finally {
+                    [IO.File]::Delete($silentLog)
+                }
+                return
+            }
+            $arguments = if ($name -in @('SetupME.exe', 'SetupSerialIO.exe')) {
+                # Intel 安装指南使用 -s 静默安装，只有加 -b 才请求自动重启。
+                $reportDir = Join-Path $DriverDir 'install-logs'
+                New-Item -ItemType Directory -Path $reportDir -Force | Out-Null
+                Write-Log -Level INFO -Message "$name 的 Intel 安装日志目录：$reportDir"
+                '-s -report "{0}"' -f $reportDir
+            } elseif ($name -match '^(SetupChipset|MEISetup|igxpin)\.exe$' -or
+                             (Get-Item -LiteralPath $FilePath).VersionInfo.CompanyName -match '^Intel\b') {
+                '-s -norestart'
+            } else {
+                '/s /norestart'
+            }
+            $process = Start-Process -FilePath $FilePath -ArgumentList $arguments -WorkingDirectory $workingDir -Wait -PassThru
+        }
+        '.msi' {
+            $arguments = '/i "{0}" /quiet /norestart REBOOT=ReallySuppress' -f $FilePath
+            $process = Start-Process -FilePath msiexec.exe -ArgumentList $arguments -WorkingDirectory $workingDir -Wait -PassThru
+        }
+        default { throw "不支持的安装包格式：$extension" }
+    }
+    Complete-DriverInstall -Name $name -ExitCode $process.ExitCode
 }
 
 # ═══════════════════════════════════════════════════════════
@@ -654,21 +1035,28 @@ function Invoke-DriverInstall {
 # ═══════════════════════════════════════════════════════════
 
 function Prompt-Reboot {
+    param([bool]$DriverFailed)
+
     Write-Section '完成'
+    Write-Host "日志已保存至：$LogFile" -ForegroundColor Cyan
     if ($script:NeedReboot) {
-        Write-Host '操作完成，需要重启才能完全生效。' -ForegroundColor Yellow
-        $choice = Read-Host '是否立即重启？(Y/N)'
-        if ($choice -match '^[Yy]') {
+        if ($DriverFailed) {
+            Write-Host '本次驱动任务有失败项，已应用的部分更改需要重启才能完全生效。' -ForegroundColor Yellow
+        } else {
+            Write-Host '所选任务已处理完毕，需要重启才能完全生效。' -ForegroundColor Yellow
+        }
+        $choice = Read-Host '是否要重启系统？(Y/N)'
+        if ($choice -match '^\s*y\s*$') {
             Write-Log -Level INFO -Message '用户确认重启'
-            Restart-Computer -Force
+            return $true
         } else {
             Write-Log -Level INFO -Message '用户选择稍后重启'
             Write-Host '请稍后手动重启以使所有设置生效。' -ForegroundColor Yellow
         }
-    } else {
+    } elseif (-not $DriverFailed) {
         Write-Host '所有设置已生效，无需重启。' -ForegroundColor Green
     }
-    Write-Host "`n日志已保存至：$LogFile" -ForegroundColor Cyan
+    return $false
 }
 
 # ═══════════════════════════════════════════════════════════
@@ -684,7 +1072,9 @@ function Main {
   .\一键优化.ps1                不带参数，全量执行所有模块
   .\一键优化.ps1 -Patch         仅安装 Windows 系统补丁
   .\一键优化.ps1 -USB           仅关闭 USB 节能、USB 重定向及系统睡眠/休眠
-  .\一键优化.ps1 -Driver        仅下载并安装 IMB-C47 驱动包
+  .\一键优化.ps1 -Driver        下载并安装适用包，按需打开 ADLINK 登录窗口
+  .\一键优化.ps1 -Driver -AdlinkPassword  在查询驱动目录前打开 ADLINK 登录窗口
+  .\一键优化.ps1 -Driver -AdlinkLogin  使用已登录的 ADLINK 浏览器会话下载
   .\一键优化.ps1 -Rollback      回退 USB 节能、USB 重定向及睡眠设置（恢复默认值）
   .\一键优化.ps1 -Help          显示此帮助信息（也可用 -h 或 -?）
 
@@ -692,18 +1082,21 @@ function Main {
   .\一键优化.ps1 -Patch -Driver  只打补丁 + 装驱动，跳过 USB/睡眠设置
 
 注意：
-  - 本脚本仅适用于 IMB-C47 产品型号
+  - 适用型号见同目录的 支持产品.psd1
   - 需以管理员身份运行
+  - 如遇 PowerShell 执行策略限制，可用 .\一键优化.cmd 传入相同参数
   - 日志输出至脚本同级目录 optimize_log.txt
 
 '@
         exit 0
     }
 
+    Assert-Admin
+
     Write-Host ''
     Write-Host '==================================================' -ForegroundColor White
     Write-Host '   引望客户系统优化脚本  v3.1' -ForegroundColor White
-    Write-Host '   仅适用于 IMB-C47 · 纯 PowerShell · 零第三方依赖' -ForegroundColor DarkGray
+    Write-Host '   适用型号见 支持产品.psd1 · 纯 PowerShell · 零第三方依赖' -ForegroundColor DarkGray
     Write-Host '==================================================' -ForegroundColor White
 
     if (-not (Test-Path $LogFile)) {
@@ -722,20 +1115,31 @@ function Main {
                    }
 
     Write-Log -Level INFO -Message "========== 脚本启动 [$modeDisplay] =========="
+    Write-Log -Level OK -Message '管理员权限验证通过'
 
-    Assert-Admin
-    # Test-ProductModel  # 本机测试时暂时关闭产品校验
+    try {
+        $products = Import-PowerShellDataFile -LiteralPath (Join-Path $ScriptDir '支持产品.psd1')
+        $product = Test-ProductModel -Products $products
+        $productId = [int]$products[$product]
+        if ($productId -le 0) { throw "型号 $product 的 ADLINK pdNo 必须为正整数。" }
+    } catch {
+        Write-Log -Level ERROR -Message "读取产品映射失败：$($_.Exception.Message)"
+        exit 1
+    }
 
+    $driverFailed = $false
     if ($Rollback) {
         Invoke-Rollback
     } else {
         if ($runAll -or $Patch)  { Install-WindowsPatches  }
         if ($runAll -or $USB)    { Invoke-UsbSleepDisable  }
-        if ($runAll -or $Driver) { Install-ImbC47Drivers   }
+        if ($runAll -or $Driver) { $driverFailed = -not (Install-AdlinkPackages -Product $product -ProductId $productId) }
     }
 
-    Prompt-Reboot
+    $restartNow = Prompt-Reboot -DriverFailed $driverFailed
     Write-Log -Level INFO -Message '========== 脚本结束 =========='
+    if ($restartNow) { Restart-Computer -Force }
+    if ($driverFailed) { exit 1 }
 }
 
 Main
