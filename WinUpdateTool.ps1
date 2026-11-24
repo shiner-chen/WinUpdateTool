@@ -1,7 +1,7 @@
 ﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
-    引望客户系统优化一键脚本 v3.1
+    WinUpdateTool v3.1
 .DESCRIPTION
     默认全量执行；通过参数可单独运行某个模块；支持回退 USB/睡眠设置。
 
@@ -1069,22 +1069,22 @@ function Main {
         Write-Host @'
 
 用法：
-  .\一键优化.ps1                不带参数，全量执行所有模块
-  .\一键优化.ps1 -Patch         仅安装 Windows 系统补丁
-  .\一键优化.ps1 -USB           仅关闭 USB 节能、USB 重定向及系统睡眠/休眠
-  .\一键优化.ps1 -Driver        下载并安装适用包，按需打开 ADLINK 登录窗口
-  .\一键优化.ps1 -Driver -AdlinkPassword  在查询驱动目录前打开 ADLINK 登录窗口
-  .\一键优化.ps1 -Driver -AdlinkLogin  使用已登录的 ADLINK 浏览器会话下载
-  .\一键优化.ps1 -Rollback      回退 USB 节能、USB 重定向及睡眠设置（恢复默认值）
-  .\一键优化.ps1 -Help          显示此帮助信息（也可用 -h 或 -?）
+  .\WinUpdateTool.ps1                不带参数，全量执行所有模块
+  .\WinUpdateTool.ps1 -Patch         仅安装 Windows 系统补丁
+  .\WinUpdateTool.ps1 -USB           仅关闭 USB 节能、USB 重定向及系统睡眠/休眠
+  .\WinUpdateTool.ps1 -Driver        下载并安装适用包，按需打开 ADLINK 登录窗口
+  .\WinUpdateTool.ps1 -Driver -AdlinkPassword  在查询驱动目录前打开 ADLINK 登录窗口
+  .\WinUpdateTool.ps1 -Driver -AdlinkLogin  使用已登录的 ADLINK 浏览器会话下载
+  .\WinUpdateTool.ps1 -Rollback      回退 USB 节能、USB 重定向及睡眠设置（恢复默认值）
+  .\WinUpdateTool.ps1 -Help          显示此帮助信息（也可用 -h 或 -?）
 
 参数可组合，例如：
-  .\一键优化.ps1 -Patch -Driver  只打补丁 + 装驱动，跳过 USB/睡眠设置
+  .\WinUpdateTool.ps1 -Patch -Driver  只打补丁 + 装驱动，跳过 USB/睡眠设置
 
 注意：
   - 适用型号见同目录的 支持产品.psd1
   - 需以管理员身份运行
-  - 如遇 PowerShell 执行策略限制，可用 .\一键优化.cmd 传入相同参数
+  - 如遇 PowerShell 执行策略限制，可用 .\WinUpdateTool.cmd 传入相同参数
   - 日志输出至脚本同级目录 optimize_log.txt
 
 '@
@@ -1095,7 +1095,7 @@ function Main {
 
     Write-Host ''
     Write-Host '==================================================' -ForegroundColor White
-    Write-Host '   引望客户系统优化脚本  v3.1' -ForegroundColor White
+    Write-Host '   WinUpdateTool v3.1' -ForegroundColor White
     Write-Host '   适用型号见 支持产品.psd1 · 纯 PowerShell · 零第三方依赖' -ForegroundColor DarkGray
     Write-Host '==================================================' -ForegroundColor White
 

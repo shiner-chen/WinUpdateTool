@@ -1,4 +1,4 @@
-# 项目说明：引望客户系统优化脚本
+# WinUpdateTool 项目说明
 
 ## 客户要求
 
@@ -51,11 +51,11 @@
 ## 交付物
 
 ```
-引望/
+WinUpdateTool/
 ├── CLAUDE.md                           # 本文件（项目说明）
 ├── 实现方案.md                         # 详细实现方案说明
-├── 一键优化.ps1                        # 主脚本（型号检测 + 补丁 + USB + 睡眠 + 驱动）
-├── 一键优化.cmd                        # 使用进程级执行策略启动主脚本
+├── WinUpdateTool.ps1                        # 主脚本（型号检测 + 补丁 + USB + 睡眠 + 驱动）
+├── WinUpdateTool.cmd                        # 使用进程级执行策略启动主脚本
 ├── 支持产品.psd1                      # 产品型号与 ADLINK pdNo 的映射
 ├── 关闭USB重定向.docx                  # 参考文档1
 └── 关闭USB节能及系统睡眠优化设置.docx  # 参考文档2
@@ -67,17 +67,17 @@
 
 | PowerShell 中的命令 | 执行内容 |
 |---------------------|----------|
-| `.\一键优化.cmd` | 全量优化 |
-| `.\一键优化.cmd -Patch` | 安装 Windows 补丁 |
-| `.\一键优化.cmd -USB` | USB 和睡眠优化 |
-| `.\一键优化.cmd -Driver` | 下载和安装驱动，官网要求登录时打开窗口 |
-| `.\一键优化.cmd -Rollback` | 回退 USB 和睡眠设置 |
-| `.\一键优化.cmd -Patch -Driver` | 安装补丁和驱动 |
+| `.\WinUpdateTool.cmd` | 全量优化 |
+| `.\WinUpdateTool.cmd -Patch` | 安装 Windows 补丁 |
+| `.\WinUpdateTool.cmd -USB` | USB 和睡眠优化 |
+| `.\WinUpdateTool.cmd -Driver` | 下载和安装驱动，官网要求登录时打开窗口 |
+| `.\WinUpdateTool.cmd -Rollback` | 回退 USB 和睡眠设置 |
+| `.\WinUpdateTool.cmd -Patch -Driver` | 安装补丁和驱动 |
 
 需要提权时，Windows 会弹出管理员授权提示。支持的 ADLINK 产品可在 `支持产品.psd1` 增加一条型号与 `pdNo` 的映射，目录和包清单由官网实时提供。
 
 官网要求登录时，脚本会打开 Windows 凭据窗口。输入 ADLINK 登录邮箱和密码，官网确认登录后，脚本会自动刷新目录并继续下载和安装。登录会话仅用于本次运行。可加 `-AdlinkPassword` 在查询目录前打开登录窗口。
 
-使用已登录的浏览器会话时，运行 `.\一键优化.cmd -Driver -AdlinkLogin`。在浏览器开发者工具的「网络」面板中，选中发往 `www.adlinktech.com.cn` 的已登录请求，把请求头中 `Cookie` 的值粘贴到脚本的隐藏输入提示中。
+使用已登录的浏览器会话时，运行 `.\WinUpdateTool.cmd -Driver -AdlinkLogin`。在浏览器开发者工具的「网络」面板中，选中发往 `www.adlinktech.com.cn` 的已登录请求，把请求头中 `Cookie` 的值粘贴到脚本的隐藏输入提示中。
 
 可以把手动下载的文件放到 `_drivers`、`_drivers\<pdNo>` 或日志给出的包目录。脚本联网获取本机适用的包清单后，优先安装文件名和大小与官网记录一致的本地包。缺少匹配文件时，下载进度条会显示包序号、包名、百分比和已下载大小。

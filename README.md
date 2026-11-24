@@ -10,21 +10,21 @@ WinUpdateTool 是面向 ADLINK 工控机的 Windows PowerShell 优化工具，�
 
 ## 快速开始
 
-下载或克隆仓库，在项目目录打开 PowerShell，通过 `一键优化.cmd` 启动。启动器的 PowerShell 执行策略仅对本次进程生效。
+下载或克隆仓库，在项目目录打开 PowerShell，通过 `WinUpdateTool.cmd` 启动。启动器的 PowerShell 执行策略仅对本次进程生效。
 
 ```powershell
-.\一键优化.cmd
+.\WinUpdateTool.cmd
 ```
 
 | 命令 | 执行内容 |
 | --- | --- |
-| `.\一键优化.cmd` | 依次安装 Windows 更新、应用 USB 和电源设置、处理驱动与软件包 |
-| `.\一键优化.cmd -Patch` | 安装 Windows 更新 |
-| `.\一键优化.cmd -USB` | 关闭 RemoteFX USB 重定向和 USB 节能，调整当前电源计划的睡眠、休眠等设置 |
-| `.\一键优化.cmd -Driver` | 下载并安装匹配的驱动与软件包 |
-| `.\一键优化.cmd -Patch -Driver` | 安装 Windows 更新、驱动与软件包 |
-| `.\一键优化.cmd -Rollback` | 将 USB 和电源设置恢复为脚本预设的默认值 |
-| `.\一键优化.cmd -Help` | 查看参数说明 |
+| `.\WinUpdateTool.cmd` | 依次安装 Windows 更新、应用 USB 和电源设置、处理驱动与软件包 |
+| `.\WinUpdateTool.cmd -Patch` | 安装 Windows 更新 |
+| `.\WinUpdateTool.cmd -USB` | 关闭 RemoteFX USB 重定向和 USB 节能，调整当前电源计划的睡眠、休眠等设置 |
+| `.\WinUpdateTool.cmd -Driver` | 下载并安装匹配的驱动与软件包 |
+| `.\WinUpdateTool.cmd -Patch -Driver` | 安装 Windows 更新、驱动与软件包 |
+| `.\WinUpdateTool.cmd -Rollback` | 将 USB 和电源设置恢复为脚本预设的默认值 |
+| `.\WinUpdateTool.cmd -Help` | 查看参数说明 |
 
 ## 驱动与软件包
 
