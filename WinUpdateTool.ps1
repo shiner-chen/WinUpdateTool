@@ -128,6 +128,7 @@ function Write-RegPolRecord {
     $newBytes  = New-Object byte[] ($bytes.Length + $entry.Length)
     [Array]::Copy($bytes, $newBytes, $bytes.Length)
     [Array]::Copy($entry, 0, $newBytes, $bytes.Length, $entry.Length)
+    [void][System.IO.Directory]::CreateDirectory([System.IO.Path]::GetDirectoryName($polFile))
     [System.IO.File]::WriteAllBytes($polFile, $newBytes)
 }
 
