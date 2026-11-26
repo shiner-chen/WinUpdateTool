@@ -7,10 +7,12 @@
 
       -Patch          仅执行系统补丁安装
       -USB            仅执行关闭 USB 节能、重定向及系统睡眠
-      -Driver         仅安装驱动及软件包
+      -Driver         导入驱动备份或安装离线驱动及软件包
       -Online         补丁使用 Windows Update，驱动使用 ADLINK 官网
       -PatchPath      指定离线补丁目录，默认为脚本同级 WinPatches
-      -DriverPath     指定离线驱动目录，默认为脚本同级 Drivers
+      -DriverPath     指定驱动导出或离线安装的目录
+      -ExportDrivers  导出第三方驱动，默认为脚本同级 ExportedDrivers
+      -SelectDrivers  导出时在终端按设备勾选驱动
       -AdlinkLogin    提示输入已登录的 ADLINK 浏览器会话 Cookie
       -AdlinkPassword 在查询驱动目录前打开 ADLINK 登录窗口
       -Rollback       回退 USB 节能、USB 重定向及睡眠设置（恢复默认值）
@@ -34,7 +36,9 @@ param(
     [switch]$AdlinkPassword,
     [switch]$Rollback,
     [Alias('h','?')]
-    [switch]$Help
+    [switch]$Help,
+    [switch]$ExportDrivers,
+    [switch]$SelectDrivers
 )
 
 Set-StrictMode -Version Latest
@@ -43,6 +47,8 @@ $ErrorActionPreference = 'Stop'
 $ScriptDir  = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $LogFile    = Join-Path $ScriptDir 'optimize_log.txt'
 $NeedReboot = $false
+$DriverBackupMarker = '.WinUpdateTool.DriverBackup'
+$DriverExportPending = "$DriverBackupMarker.pending"
 
 # ═══════════════════════════════════════════════════════════
 # 通用工具
@@ -1196,42 +1202,189 @@ function Install-DriverInf {
     Complete-DriverInstall -Name 'pnputil' -ExitCode $exitCode
 }
 
+function Select-DriverPackages {
+    if ([Console]::IsInputRedirected -or [Console]::IsOutputRedirected) {
+        throw '请在交互式终端中使用 -SelectDrivers。'
+    }
+
+    $devices = @(Get-CimInstance -ClassName Win32_PnPSignedDriver `
+        -Property DeviceName,FriendlyName,DeviceClass,DriverProviderName,DriverVersion,InfName |
+        Where-Object { $_.InfName -match '^oem[0-9]+\.inf$' -and ($_.FriendlyName -or $_.DeviceName) } |
+        Sort-Object DeviceClass,DeviceName,FriendlyName,DriverProviderName,DriverVersion,InfName -Unique)
+    if ($devices.Count -eq 0) { throw '没有找到可选择的第三方设备驱动。' }
+
+    $classes = @{ DISPLAY = '显卡'; MEDIA = '声卡'; NET = '网卡'; SYSTEM = '系统设备'; SOFTWARECOMPONENT = '软件组件' }
+    $selected = [Collections.Generic.HashSet[int]]::new()
+    $cursor = $first = 0
+    try {
+        while ($true) {
+            $height = [Math]::Max(1, [Console]::WindowHeight - 5)
+            $width = [Math]::Max(1, [Console]::WindowWidth - 1)
+            $first = [Math]::Min($first, [Math]::Max(0, $devices.Count - $height))
+            $first = [Math]::Max([Math]::Min($first, $cursor), $cursor - $height + 1)
+            $last = [Math]::Min($first + $height, $devices.Count)
+
+            Clear-Host
+            Write-Host '选择要导出的驱动' -ForegroundColor Cyan
+            for ($i = $first; $i -lt $last; $i++) {
+                $device = $devices[$i]
+                $name = if ($device.FriendlyName) { $device.FriendlyName } else { $device.DeviceName }
+                $class = [string]$device.DeviceClass
+                if ($classes.ContainsKey($class)) { $class = $classes[$class] }
+                $mark = if ($selected.Contains($i)) { 'x' } else { ' ' }
+                $pointer = if ($i -eq $cursor) { '>' } else { ' ' }
+                $line = "${pointer} [$mark] $class  $name"
+                while ($Host.UI.RawUI.LengthInBufferCells($line) -gt $width) {
+                    $line = $line.Substring(0, $line.Length - 1)
+                }
+                Write-Host $line
+            }
+            $device = $devices[$cursor]
+            Write-Host ('{0}  {1}' -f $device.DriverProviderName, $device.DriverVersion)
+            Write-Host ('第 {0}/{1} 项，已勾选 {2} 项' -f ($cursor + 1), $devices.Count, $selected.Count)
+            Write-Host '↑/↓ 移动  空格 勾选  Enter 导出  Esc 取消'
+
+            switch ([Console]::ReadKey($true).Key) {
+                UpArrow { $cursor = [Math]::Max(0, $cursor - 1) }
+                DownArrow { $cursor = [Math]::Min($devices.Count - 1, $cursor + 1) }
+                PageUp { $cursor = [Math]::Max(0, $cursor - $height) }
+                PageDown { $cursor = [Math]::Min($devices.Count - 1, $cursor + $height) }
+                Spacebar { if (-not $selected.Add($cursor)) { [void]$selected.Remove($cursor) } }
+                Enter {
+                    if ($selected.Count -gt 0) {
+                        return ($selected | ForEach-Object { $devices[$_].InfName } | Sort-Object -Unique)
+                    }
+                }
+                Escape { return }
+            }
+        }
+    } finally {
+        Clear-Host
+    }
+}
+
+function Export-DriverPackages {
+    param([string]$Path, [string[]]$Packages)
+
+    if (Test-Path -LiteralPath $Path) {
+        if (-not (Test-Path -LiteralPath $Path -PathType Container) -or
+            (Get-ChildItem -LiteralPath $Path -Force | Select-Object -First 1)) {
+            throw "导出目标必须是新目录或空目录。$Path"
+        }
+    }
+    [void][IO.Directory]::CreateDirectory($Path)
+    $pending = Join-Path $Path $DriverExportPending
+    $marker = Join-Path $Path $DriverBackupMarker
+    # 同一目标同时只能有一个导出任务。失败时保留标记，避免导入不完整的备份。
+    [IO.File]::Open($pending, [IO.FileMode]::CreateNew).Dispose()
+    if (Get-ChildItem -LiteralPath $Path -Force | Where-Object Name -ne $DriverExportPending | Select-Object -First 1) {
+        [IO.File]::Delete($pending)
+        throw "导出目标必须是新目录或空目录。$Path"
+    }
+
+    Write-Log -Level INFO -Message "驱动导出目录为 $Path"
+    $failed = @(
+        foreach ($package in $Packages) {
+            Write-Log -Level INFO -Message "正在导出 $package"
+            & pnputil.exe /export-driver $package $Path | ForEach-Object {
+                if ($_) { Write-Log -Level INFO -Message $_ }
+            }
+            if ($LASTEXITCODE -ne 0) {
+                Write-Log -Level ERROR -Message "$package 导出失败。PnPUtil 退出码 $LASTEXITCODE。"
+                $package
+            }
+        }
+    )
+    if ($failed.Count -gt 0) { throw "PnPUtil 未完成导出。未完成的备份保留在 $Path。" }
+    if (-not (Get-OfflineDriverEntries -Path $Path -InfOnly | Select-Object -First 1)) {
+        throw "没有导出可用的第三方驱动 INF。$Path"
+    }
+    [IO.File]::Move($pending, $marker)
+    Write-Log -Level OK -Message "驱动导出完成。$Path"
+}
+
 function Get-OfflineDriverEntries {
-    param([string]$Path, [switch]$PackageDirectory)
+    param([string]$Path, [switch]$PackageDirectory, [switch]$InfOnly)
 
     $files = @(Get-ChildItem -LiteralPath $Path -File)
-    if ($PackageDirectory) {
+    if ($InfOnly) {
+        $files | Where-Object Extension -eq '.inf' | ForEach-Object FullName
+    } elseif ($PackageDirectory) {
         $entry = Find-DriverInstaller -Files $files
         if ($entry) {
             $entry.FullName
             return
         }
     }
-    $files | Where-Object Extension -in '.zip', '.exe', '.msi', '.inf' | ForEach-Object FullName
+    if (-not $InfOnly) {
+        $files | Where-Object Extension -in '.zip', '.exe', '.msi', '.inf' | ForEach-Object FullName
+    }
     foreach ($directory in (Get-ChildItem -LiteralPath $Path -Directory | Where-Object { -not ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) })) {
-        Get-OfflineDriverEntries -Path $directory.FullName -PackageDirectory
+        if ((Test-Path -LiteralPath (Join-Path $directory.FullName $DriverBackupMarker) -PathType Leaf) -or
+            (Test-Path -LiteralPath (Join-Path $directory.FullName $DriverExportPending) -PathType Leaf)) { continue }
+        Get-OfflineDriverEntries -Path $directory.FullName -PackageDirectory -InfOnly:$InfOnly
     }
 }
 
-function Install-OfflineDrivers {
+function Find-OfflineDriverSource {
     param([string]$Path)
 
-    Write-Section '离线驱动和软件包安装'
-    Write-Log -Level INFO -Message "驱动和软件包目录为 $Path"
-    $entries = @(Get-OfflineDriverEntries -Path $Path | Sort-Object)
-    if ($entries.Count -eq 0) {
-        Write-Log -Level INFO -Message '目录中没有 ZIP、EXE、MSI 或 INF 安装包。请将离线安装包复制到该目录。'
-        return $true
+    $paths = if ($Path) { $Path } else { Join-Path $ScriptDir 'ExportedDrivers'; Join-Path $ScriptDir 'Drivers' }
+    foreach ($candidate in $paths) {
+        $directory = Get-Item -LiteralPath $candidate -ErrorAction SilentlyContinue
+        if ($directory -isnot [IO.DirectoryInfo]) {
+            Write-Host "[INFO] 驱动目录不存在或不可访问。$candidate"
+            continue
+        }
+        $sourcePath = $directory.FullName
+        $pending = Join-Path $sourcePath $DriverExportPending
+        $marker = Join-Path $sourcePath $DriverBackupMarker
+        $wasBackup = Test-Path -LiteralPath $marker -PathType Leaf
+        if (Test-Path -LiteralPath $pending -PathType Leaf) {
+            Write-Host "[INFO] 驱动备份尚未导出完成。$sourcePath"
+            continue
+        }
+        $infOnly = $wasBackup -or $directory.Name -eq 'ExportedDrivers'
+        $entries = @(Get-OfflineDriverEntries -Path $sourcePath -InfOnly:$infOnly | Sort-Object)
+        if (Test-Path -LiteralPath $pending -PathType Leaf) {
+            Write-Host "[INFO] 驱动备份尚未导出完成。$sourcePath"
+            continue
+        }
+        if (-not $wasBackup -and (Test-Path -LiteralPath $marker -PathType Leaf)) {
+            # 扫描期间刚完成导出时，重新读取完整的 INF 清单。
+            $infOnly = $true
+            $entries = @(Get-OfflineDriverEntries -Path $sourcePath -InfOnly | Sort-Object)
+        }
+        if ($entries.Count -gt 0) {
+            return @{ Path = $sourcePath; InfOnly = $infOnly; Entries = $entries }
+        }
+        Write-Host "[INFO] 目录中没有可用的驱动或安装包。$sourcePath"
     }
+    throw '未找到可用驱动。请复制驱动备份或离线安装包，或使用 -DriverPath 指定目录。'
+}
 
-    $workDir = Join-Path $ScriptDir '_drivers\offline'
-    New-Item -ItemType Directory -Path $workDir -Force | Out-Null
+function Install-OfflineDrivers {
+    param([hashtable]$Source)
+
+    $path = $Source.Path
+    $entries = $Source.Entries
+    if ($Source.InfOnly) {
+        Write-Section '导入驱动备份'
+    } else {
+        Write-Section '离线驱动和软件包安装'
+        $workDir = Join-Path $ScriptDir '_drivers\offline'
+        New-Item -ItemType Directory -Path $workDir -Force | Out-Null
+    }
+    Write-Log -Level INFO -Message "驱动目录为 $path"
+
     $index = $skipped = $failed = 0
     foreach ($entry in $entries) {
         $index++
         try {
             Write-Log -Level INFO -Message "正在安装 [$index/$($entries.Count)] $entry"
-            $status = Invoke-DriverInstall -FilePath $entry -DriverDir $workDir
+            $status = if ($Source.InfOnly) { Install-DriverInf -Path $entry } else {
+                Invoke-DriverInstall -FilePath $entry -DriverDir $workDir
+            }
             if ($status -eq 'Skipped') {
                 $skipped++
             } elseif ($status -ne 'PnPProcessed') {
@@ -1384,14 +1537,20 @@ WinUpdateTool 使用说明
   .\WinUpdateTool.cmd -Help       查看帮助（也可用 -h 或 -?）
   .\WinUpdateTool.cmd             全量执行，默认离线安装补丁和驱动，并应用 USB 与电源设置
   .\WinUpdateTool.cmd -Patch      仅安装离线 Windows 补丁
-  .\WinUpdateTool.cmd -Driver     仅安装离线驱动和软件包
+  .\WinUpdateTool.cmd -Driver     优先导入 ExportedDrivers，否则安装 Drivers 中的离线包
   .\WinUpdateTool.cmd -USB        仅应用 USB 重定向、USB 节能及电源设置
   .\WinUpdateTool.cmd -Rollback   将 USB 重定向、USB 节能及睡眠设置恢复为默认值
 
 指定离线目录
-  默认从工具目录下的 WinPatches 和 Drivers 读取安装包。
+  默认从工具目录下的 WinPatches 读取补丁。
   .\WinUpdateTool.cmd -Patch -PatchPath "D:\离线补丁"
   .\WinUpdateTool.cmd -Driver -DriverPath "D:\离线驱动"
+
+导出驱动
+  默认创建工具目录下的 ExportedDrivers。自定义目标需为新目录或空目录。
+  .\WinUpdateTool.cmd -ExportDrivers
+  .\WinUpdateTool.cmd -ExportDrivers -SelectDrivers -DriverPath "D:\驱动备份"
+  导入时将备份目录整体复制到目标机器，然后运行 -Driver，或加 -DriverPath 指定备份。
 
 联网安装
   -Online 为本次选中的补丁或驱动任务启用联网安装。
@@ -1410,7 +1569,16 @@ WinUpdateTool 使用说明
         exit 0
     }
 
-    $runAll = -not ($Patch -or $USB -or $Driver -or $Rollback)
+    if ($SelectDrivers -and -not $ExportDrivers) {
+        Write-Host '请将 -SelectDrivers 与 -ExportDrivers 一起使用。' -ForegroundColor Red
+        exit 1
+    }
+    if ($ExportDrivers -and ($Patch -or $USB -or $Driver -or $Rollback -or $Online -or $PatchPath)) {
+        Write-Host '请单独运行 -ExportDrivers，可使用 -SelectDrivers 和 -DriverPath。' -ForegroundColor Red
+        exit 1
+    }
+
+    $runAll = -not ($Patch -or $USB -or $Driver -or $Rollback -or $ExportDrivers)
     $runPatch = -not $Rollback -and ($runAll -or $Patch)
     $runDriver = -not $Rollback -and ($runAll -or $Driver)
 
@@ -1422,32 +1590,47 @@ WinUpdateTool 使用说明
         Write-Host 'ADLINK 登录选项需要在线驱动安装。请使用 -Driver -Online。' -ForegroundColor Red
         exit 1
     }
-    $offlineDirectories = @{}
-    if (-not $Online) {
-        $requiredDirectories = @(
-            if ($runPatch) {
-                @{ Parameter = 'PatchPath'; Value = $PatchPath; Folder = 'WinPatches'; Switch = '-Patch'; Content = '离线补丁包（MSU 或 CAB）' }
+    if ($ExportDrivers) {
+        $exportPath = Join-Path $ScriptDir 'ExportedDrivers'
+        if ($DriverPath) {
+            try {
+                $provider = $null
+                $drive = $null
+                $exportPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath(
+                    $DriverPath, [ref]$provider, [ref]$drive)
+                if ($provider.Name -ne 'FileSystem') { throw '导出目标必须是文件系统目录。' }
+                $root = [IO.Path]::GetPathRoot($exportPath)
+                if ($exportPath.Length -gt $root.Length) { $exportPath = $exportPath.TrimEnd('\', '/') }
+                $script:PSBoundParameters['DriverPath'] = $exportPath
+            } catch {
+                Write-Host "无效的驱动导出路径。$DriverPath。$($_.Exception.Message)" -ForegroundColor Red
+                exit 1
             }
-            if ($runDriver) {
-                @{ Parameter = 'DriverPath'; Value = $DriverPath; Folder = 'Drivers'; Switch = '-Driver'; Content = '离线驱动和软件包（ZIP、EXE、MSI 或 INF）' }
-            }
-        )
-        $missingDirectory = $false
-        foreach ($directory in $requiredDirectories) {
-            $path = $directory.Value
-            if (-not $path) { $path = Join-Path $ScriptDir $directory.Folder }
-            $item = Get-Item -LiteralPath $path -ErrorAction SilentlyContinue
-            if ($item -isnot [IO.DirectoryInfo]) {
-                Write-Host "[INFO] 目录不存在或不可访问。$path"
-                Write-Host ('       请创建该目录并复制{0}，或通过 {1} -{2} "<现有目录>" 指定目录。' -f
-                    $directory.Content, $directory.Switch, $directory.Parameter)
-                $missingDirectory = $true
-                continue
-            }
-            $offlineDirectories[$directory.Parameter] = $item.FullName
-            if ($directory.Value) { $script:PSBoundParameters[$directory.Parameter] = $item.FullName }
         }
-        if ($missingDirectory) { exit 1 }
+    } elseif (-not $Online) {
+        $preflightFailed = $false
+        if ($runPatch) {
+            $path = if ($PatchPath) { $PatchPath } else { Join-Path $ScriptDir 'WinPatches' }
+            $item = Get-Item -LiteralPath $path -ErrorAction SilentlyContinue
+            if ($item -is [IO.DirectoryInfo]) {
+                $offlinePatchPath = $item.FullName
+                if ($PatchPath) { $script:PSBoundParameters['PatchPath'] = $offlinePatchPath }
+            } else {
+                Write-Host "[INFO] 目录不存在或不可访问。$path"
+                Write-Host '       请创建该目录并复制离线补丁包（MSU 或 CAB），或通过 -Patch -PatchPath "<现有目录>" 指定目录。'
+                $preflightFailed = $true
+            }
+        }
+        if ($runDriver) {
+            try {
+                $offlineDriverSource = Find-OfflineDriverSource -Path $DriverPath
+                if ($DriverPath) { $script:PSBoundParameters['DriverPath'] = $offlineDriverSource.Path }
+            } catch {
+                Write-Host $_.Exception.Message -ForegroundColor Red
+                $preflightFailed = $true
+            }
+        }
+        if ($preflightFailed) { exit 1 }
     }
 
     Assert-Admin
@@ -1464,6 +1647,7 @@ WinUpdateTool 使用说明
 
     $modeDisplay = if ($runAll)       { '全量执行' }
                    elseif ($Rollback) { '回退模式' }
+                   elseif ($ExportDrivers) { '驱动导出' }
                    else {
                        $parts = @()
                        if ($Patch)  { $parts += '补丁安装' }
@@ -1474,6 +1658,23 @@ WinUpdateTool 使用说明
 
     Write-Log -Level INFO -Message "========== 脚本启动 [$modeDisplay] =========="
     Write-Log -Level OK -Message '管理员权限验证通过'
+
+    if ($ExportDrivers) {
+        try {
+            $packages = if ($SelectDrivers) { Select-DriverPackages } else { '*' }
+            if ($packages) {
+                Export-DriverPackages -Path $exportPath -Packages $packages
+            } else {
+                Write-Log -Level INFO -Message '已取消驱动导出。'
+            }
+        } catch {
+            Write-Log -Level ERROR -Message "驱动导出未完成。$($_.Exception.Message)"
+            exit 1
+        } finally {
+            Write-Log -Level INFO -Message '========== 脚本结束 =========='
+        }
+        return
+    }
 
     if ($Online -and $runDriver) {
         try {
@@ -1493,7 +1694,7 @@ WinUpdateTool 使用说明
     } else {
         if ($runPatch) {
             try {
-                $patchOk = if ($Online) { Install-WindowsPatches } else { Install-OfflineWindowsPatches -Path $offlineDirectories.PatchPath }
+                $patchOk = if ($Online) { Install-WindowsPatches } else { Install-OfflineWindowsPatches -Path $offlinePatchPath }
                 $packageFailed = -not $patchOk
             } catch {
                 $packageFailed = $true
@@ -1504,7 +1705,7 @@ WinUpdateTool 使用说明
         if ($runDriver) {
             try {
                 $driverOk = if ($Online) { Install-AdlinkPackages -Product $product -ProductId $productId } else {
-                    Install-OfflineDrivers -Path $offlineDirectories.DriverPath
+                    Install-OfflineDrivers -Source $offlineDriverSource
                 }
                 $packageFailed = $packageFailed -or -not $driverOk
             } catch {

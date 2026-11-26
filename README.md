@@ -22,8 +22,10 @@ WinUpdateTool 是面向 ADLINK 工控机的 Windows PowerShell 优化工具，�
 | `.\WinUpdateTool.cmd -Patch` | 安装 `WinPatches` 中适用于本机的补丁 |
 | `.\WinUpdateTool.cmd -Patch -PatchPath "D:\离线补丁"` | 安装指定目录中的补丁 |
 | `.\WinUpdateTool.cmd -USB` | 关闭 RemoteFX USB 重定向和 USB 节能，调整当前电源计划的睡眠、休眠等设置 |
-| `.\WinUpdateTool.cmd -Driver` | 安装 `Drivers` 中的驱动与软件包 |
+| `.\WinUpdateTool.cmd -Driver` | 优先导入 `ExportedDrivers` 中的驱动备份，备份缺失或为空时使用 `Drivers` 中的离线包 |
 | `.\WinUpdateTool.cmd -Driver -DriverPath "D:\离线驱动"` | 安装指定目录中的驱动与软件包 |
+| `.\WinUpdateTool.cmd -ExportDrivers` | 将第三方驱动包导出到脚本同级的 `ExportedDrivers` |
+| `.\WinUpdateTool.cmd -ExportDrivers -SelectDrivers -DriverPath "D:\驱动备份"` | 在终端按设备勾选并导出到指定目录 |
 | `.\WinUpdateTool.cmd -Patch -Online` | 通过 Windows Update 或企业 WSUS 安装补丁 |
 | `.\WinUpdateTool.cmd -Driver -Online` | 从 ADLINK 官网匹配、下载并安装驱动与软件包 |
 | `.\WinUpdateTool.cmd -Online` | 全量执行，补丁与驱动模块使用在线模式 |
@@ -35,6 +37,16 @@ WinUpdateTool 是面向 ADLINK 工控机的 Windows PowerShell 优化工具，�
 补丁模块递归读取 MSU 和 CAB 包，按包元数据安排服务堆栈和累积更新的顺序，由 Windows 判定适用性和已安装状态。安装前置补丁后会重试可继续处理的包。如果某个补丁需要等到重启后才能继续，重启后重新运行原命令。可在补丁目录放置 `Dependencies.psd1` 声明额外的安装依赖，格式见实现方案。[实现方案.md](./实现方案.md)
 
 驱动模块处理 ZIP、EXE、MSI 和 INF。解压后的安装包可放在各自的子目录中，脚本会识别常见的主安装程序。
+
+## 驱动备份与导入
+
+默认将驱动备份放在 `ExportedDrivers`，将厂商离线安装包放在 `Drivers`。两者可以放在同一个上级目录的不同子目录中。自定义导出目标需为新目录或空目录。
+
+通过 `.cmd` 指定带空格的路径时，加双引号并省略路径末尾的反斜杠，例如 `-DriverPath "D:\驱动 备份"`。
+
+使用 `-SelectDrivers` 时，上下方向键移动，空格勾选或取消，Enter 确认导出，Esc 取消。单独运行 `-ExportDrivers` 可导出驱动存储中的全部第三方驱动包。
+
+将备份目录整体复制到目标机器。放在脚本同级并命名为 `ExportedDrivers` 时，运行 `.\WinUpdateTool.cmd -Driver` 即可导入。放在其他位置时，运行 `.\WinUpdateTool.cmd -Driver -DriverPath "D:\驱动备份"`。成功导出的目录可改名，目录中的备份标记会让脚本只导入 INF。需要厂商应用时，另外用 `-DriverPath .\Drivers` 安装离线包。
 
 ## 在线驱动与软件包
 
